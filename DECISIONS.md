@@ -14,13 +14,13 @@ Start as a modular monolith with independently runnable API, SQS consumer, outbo
 
 ## ADR-003 — Exact money representation
 
-Status: proposed.
+Status: accepted for the domain layer.
 
-Represent domain money as integer minor units using `bigint`, expose fixed-scale decimal strings, and persist exact PostgreSQL `NUMERIC(38,2)`. Never convert monetary amounts through JavaScript `number`.
+Represent domain money as integer minor units using `bigint` and expose fixed-scale decimal strings. The domain implementation is independent of database types; the planned PostgreSQL adapter will use exact `NUMERIC(38,2)`. Never convert monetary amounts through JavaScript `number`.
 
 ## ADR-004 — Wallet concurrency
 
-Status: proposed.
+Status: proposed; database serialization is not implemented yet.
 
 Serialize operations on one wallet using a PostgreSQL row lock inside the same transaction as wager, wallet, and ledger writes. Distinct wallets remain independently processable.
 
@@ -56,6 +56,6 @@ Do not implement custom authentication or an identity provider in this timebox. 
 
 ## ADR-010 — Currency scope
 
-Status: proposed.
+Status: accepted for the domain layer.
 
-Exercise financial flows in BRL while keeping `Money` currency-aware and rejecting operations across different currencies.
+Exercise financial flows in BRL while keeping `Money` currency-aware and rejecting operations across different currencies. The domain validates ISO-4217 codes against the runtime's `Intl` currency data and checks that every arithmetic operation uses matching codes.
