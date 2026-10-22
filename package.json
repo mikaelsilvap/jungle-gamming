@@ -14,9 +14,16 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "test": "bun test",
+    "db:migrate": "bun run src/persistence/migrate.ts up",
+    "db:rollback": "bun run src/persistence/migrate.ts down",
+    "db:migrate:production": "MIKRO_ORM_MIGRATIONS_PATH=dist bun run dist/src/persistence/migrate.js up",
+    "test:integration": "bun test test/integration",
     "smoke": "bash scripts/smoke.sh"
   },
   "dependencies": {
+    "@mikro-orm/core": "7.2.0",
+    "@mikro-orm/migrations": "7.2.0",
+    "@mikro-orm/postgresql": "7.2.0",
     "@nestjs/common": "11.1.6",
     "@nestjs/core": "11.1.6",
     "@nestjs/platform-express": "11.1.6",
