@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { Money, WagerTransactionKind, WagerTransactionStatus } from '../../src/domain';
+import { FailureCode, Money, WagerTransactionKind, WagerTransactionStatus } from '../../src/domain';
 import { InboxMessageRecord, OutboxMessageRecord, WalletLedgerEntryRecord, WalletRecord, WagerTransactionRecord } from '../../src/persistence/entities';
 import { createOrm } from '../../src/persistence/orm';
 import { WalletPostgresAdapter } from '../../src/persistence/wallet-postgres.adapter';
@@ -12,10 +12,12 @@ import {
   rehydrateWagerTransaction,
 } from '../../src/persistence/rehydration';
 import { WalletOpeningService } from '../../src/wallets/wallet-opening.service';
+import { ProcessWagerInput, ProcessWagerService } from '../../src/wagering/process-wager.service';
 
 const testDatabaseName = process.env.TEST_DATABASE_NAME ?? 'wagering_phase2_test';
 let orm: Awaited<ReturnType<typeof createOrm>>;
 let wallets: WalletOpeningService;
+let wagers: ProcessWagerService;
 
 function id(): string { return randomUUID(); }
 function hash(): string { return 'a'.repeat(64); }
@@ -49,6 +51,7 @@ beforeAll(async () => {
   await orm.migrator.down({ to: 0 });
   await orm.migrator.up();
   wallets = new WalletOpeningService(new WalletPostgresAdapter(orm));
+  wagers = new ProcessWagerService(orm);
 });
 
 afterAll(async () => {
@@ -112,6 +115,9 @@ describe('PostgreSQL persistence phase 2', () => {
     expect(transactionDomain.status).toBe(WagerTransactionStatus.Processed);
     const ledgerEntity = await entityManager.findOneOrFail(WalletLedgerEntryRecord, { walletId: wallet.id });
     expect(rehydrateLedgerEntry(ledgerEntity).isBalanced()).toBe(true);
+    const [openingEvents] = await orm.em.getConnection().execute<Array<{ count: string }>>(
+      `select count(*)::text as count from outbox_messages where aggregate_id = ? and event_type in ('WagerTransactionProcessed','WalletBalanceChanged')`, [wallet.id]);
+    expect(openingEvents?.count).toBe('2');
   });
 
   test('enforces player and currency uniqueness under concurrent wallet openings', async () => {
@@ -241,5 +247,175 @@ describe('PostgreSQL persistence phase 2', () => {
       storedBalance: { amount: '25.10', currency: 'BRL' }, calculatedBalance: { amount: '25.10', currency: 'BRL' },
       difference: { amount: '0.00', currency: 'BRL' }, consistent: true, checkedEntries: 3,
     });
+  });
+});
+
+describe('PostgreSQL wagering phase 3', () => {
+  async function request(walletId: string, playerId: string, overrides: Partial<ProcessWagerInput> = {}): Promise<ProcessWagerInput> {
+    return {
+      providerId: `provider-${playerId}`, externalTransactionId: id(), playerId, walletId,
+      roundId: 'round-phase3', gameId: 'game-phase3', kind: WagerTransactionKind.Bet,
+      money: { amount: '10.00', currency: 'BRL' }, ...overrides,
+    };
+  }
+
+  test('processes one BET among 50 concurrent identical submissions and replays the original balance', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = await request(wallet.id, playerId);
+    const key = `same:${id()}`;
+    const results = await Promise.all(Array.from({ length: 50 }, () => wagers.process(input, key)));
+    expect(results.filter((result) => !result.idempotentReplay)).toHaveLength(1);
+    expect(results.every((result) => result.status === 'PROCESSED')).toBe(true);
+    const first = results.find((result) => !result.idempotentReplay)!;
+    expect(first.balance.amount).toBe('90.00');
+    await wagers.process(await request(wallet.id, playerId, {
+      kind: WagerTransactionKind.Win, externalTransactionId: id(), money: { amount: '5.00', currency: 'BRL' },
+    }), `later:${id()}`);
+    const replay = await wagers.process(input, key);
+    expect(replay.idempotentReplay).toBe(true);
+    expect(replay.balance.amount).toBe('90.00');
+    const [counts] = await orm.em.getConnection().execute<Array<{ transactions: string; entries: string; events: string }>>(
+      `select (select count(*) from wager_transactions where wallet_id = ? and kind = 'BET')::text as transactions,
+       (select count(*) from wallet_ledger_entries where wallet_id = ? and direction = 'DEBIT')::text as entries,
+       (select count(*) from outbox_messages where aggregate_id = ? and event_type in ('WagerTransactionProcessed','WalletBalanceChanged'))::text as events`,
+      [wallet.id, wallet.id, wallet.id]);
+    expect(counts).toEqual({ transactions: '1', entries: '1', events: '6' });
+  });
+
+  test('serializes competing BETs on one PostgreSQL wallet lock', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const [first, second] = await Promise.all([
+      request(wallet.id, playerId, { money: { amount: '80.00', currency: 'BRL' } }),
+      request(wallet.id, playerId, { money: { amount: '80.00', currency: 'BRL' } }),
+    ]);
+    const outcomes = await Promise.all([
+      wagers.process(first, `key:${id()}`), wagers.process(second, `key:${id()}`),
+    ]);
+    expect(outcomes.filter((result) => result.status === 'PROCESSED')).toHaveLength(1);
+    expect(outcomes.filter((result) => result.status === 'REJECTED' && result.failureCode === 'INSUFFICIENT_FUNDS')).toHaveLength(1);
+    expect((await wallets.get(wallet.id))?.balance.amount).toBe('20.00');
+    const [entries] = await orm.em.getConnection().execute<Array<{ count: string }>>(
+      `select count(*)::text as count from wallet_ledger_entries where wallet_id = ? and direction = 'DEBIT'`, [wallet.id]);
+    expect(entries?.count).toBe('1');
+  });
+
+  test('conflicting idempotency payload has no second financial side effect', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = await request(wallet.id, playerId);
+    const key = `conflict:${id()}`;
+    await wagers.process(input, key);
+    await expect(wagers.process({ ...input, money: { amount: '11.00', currency: 'BRL' } }, key)).rejects.toThrow('different payload');
+    expect((await wallets.get(wallet.id))?.balance.amount).toBe('90.00');
+  });
+
+  test('persists missing reversal references as pending without ledger or balance events', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = await request(wallet.id, playerId, {
+      kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'not-arrived',
+      money: { amount: '10.00', currency: 'BRL' },
+    });
+    const result = await wagers.process(input, `pending:${id()}`);
+    expect(result.status).toBe(WagerTransactionStatus.PendingReference);
+    const [counts] = await orm.em.getConnection().execute<Array<{ entries: string; pending: string; pendingEvents: string; balanceEvents: string }>>(
+      `select (select count(*) from wallet_ledger_entries where transaction_id = ?)::text as entries,
+       (select count(*) from wager_transactions where id = ? and status = 'PENDING_REFERENCE')::text as pending,
+       (select count(*) from outbox_messages where aggregate_id = ? and event_type = 'WagerTransactionPendingReference')::text as "pendingEvents",
+       (select count(*) from outbox_messages where aggregate_id = ? and event_type = 'WalletBalanceChanged')::text as "balanceEvents"`,
+      [result.transactionId, result.transactionId, wallet.id, wallet.id]);
+    expect(counts).toEqual({ entries: '0', pending: '1', pendingEvents: '1', balanceEvents: '1' });
+  });
+
+  test('processes BET, REFUND and ROLLBACK with durable single-reversal semantics', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const betInput = await request(wallet.id, playerId, { money: { amount: '10.00', currency: 'BRL' } });
+    const bet = await wagers.process(betInput, `bet:${id()}`);
+    expect(bet.status).toBe(WagerTransactionStatus.Processed);
+    const refundInput = await request(wallet.id, playerId, {
+      kind: WagerTransactionKind.Refund, referenceExternalTransactionId: betInput.externalTransactionId,
+      money: { amount: '10.00', currency: 'BRL' },
+    });
+    const refund = await wagers.process(refundInput, `refund:${id()}`);
+    expect(refund.status).toBe(WagerTransactionStatus.Processed);
+    const rollbackInput = await request(wallet.id, playerId, {
+      kind: WagerTransactionKind.Rollback, referenceExternalTransactionId: refundInput.externalTransactionId,
+      money: { amount: '10.00', currency: 'BRL' },
+    });
+    expect((await wagers.process(rollbackInput, `rollback:${id()}`)).status).toBe(WagerTransactionStatus.Processed);
+    const duplicateRefundInput = { ...refundInput, externalTransactionId: id() };
+    const duplicateRefund = await wagers.process(duplicateRefundInput, `refund-duplicate:${id()}`);
+    expect(duplicateRefund.status).toBe(WagerTransactionStatus.Rejected);
+    expect(duplicateRefund.failureCode).toBe(FailureCode.ReferenceAlreadyReversed);
+    const page = await wallets.ledger(wallet.id, undefined, 20);
+    expect(page?.entries.map((entry) => (entry as { direction: string }).direction)).toEqual(['DEBIT', 'CREDIT', 'DEBIT', 'CREDIT']);
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('supports ROLLBACK of processed BET, WIN, and REFUND directions', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const submit = async (kind: WagerTransactionKind, amount: string, referenceExternalTransactionId?: string) => {
+      const input = await request(wallet.id, playerId, {
+        kind, money: { amount, currency: 'BRL' },
+        ...(referenceExternalTransactionId ? { referenceExternalTransactionId } : {}),
+      });
+      return { input, result: await wagers.process(input, `${kind}:${id()}`) };
+    };
+    const bet = await submit(WagerTransactionKind.Bet, '10.00');
+    expect(bet.result.status).toBe(WagerTransactionStatus.Processed);
+    expect((await submit(WagerTransactionKind.Rollback, '10.00', bet.input.externalTransactionId)).result.status)
+      .toBe(WagerTransactionStatus.Processed);
+    const win = await submit(WagerTransactionKind.Win, '5.00');
+    expect((await submit(WagerTransactionKind.Rollback, '5.00', win.input.externalTransactionId)).result.status)
+      .toBe(WagerTransactionStatus.Processed);
+    const secondBet = await submit(WagerTransactionKind.Bet, '10.00');
+    const refund = await submit(WagerTransactionKind.Refund, '10.00', secondBet.input.externalTransactionId);
+    expect(refund.result.status).toBe(WagerTransactionStatus.Processed);
+    expect((await submit(WagerTransactionKind.Rollback, '10.00', refund.input.externalTransactionId)).result.status)
+      .toBe(WagerTransactionStatus.Processed);
+    expect((await wallets.get(wallet.id))?.balance.amount).toBe('90.00');
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('LOSS and rejected operations create durable results without ledger or balance-change events', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '1.00', currency: 'BRL' } });
+    const loss = await wagers.process(await request(wallet.id, playerId, { kind: WagerTransactionKind.Loss }), `loss:${id()}`);
+    const rejected = await wagers.process(await request(wallet.id, playerId, { money: { amount: '2.00', currency: 'BRL' } }), `bet-reject:${id()}`);
+    expect(loss.status).toBe(WagerTransactionStatus.Processed);
+    expect(rejected.status).toBe(WagerTransactionStatus.Rejected);
+    expect(rejected.failureCode).toBe(FailureCode.InsufficientFunds);
+    expect((await wallets.get(wallet.id))?.balance.amount).toBe('1.00');
+    const [counts] = await orm.em.getConnection().execute<Array<{ entries: string; balanceEvents: string; rejectedEvents: string }>>(
+      `select (select count(*) from wallet_ledger_entries where wallet_id = ?)::text as entries,
+       (select count(*) from outbox_messages where aggregate_id = ? and event_type = 'WalletBalanceChanged')::text as "balanceEvents",
+       (select count(*) from outbox_messages where aggregate_id = ? and event_type = 'WagerTransactionRejected')::text as "rejectedEvents"`,
+      [wallet.id, wallet.id, wallet.id]);
+    expect(counts).toEqual({ entries: '1', balanceEvents: '1', rejectedEvents: '1' });
+  });
+
+  test('rolls transaction, balance, ledger and outbox back together when ledger insertion fails', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '20.00', currency: 'BRL' } });
+    await orm.em.getConnection().execute(`create function test_phase3_reject_ledger() returns trigger language plpgsql as $$
+      begin if new.wallet_id = '${wallet.id}'::uuid then raise exception 'phase3 forced failure'; end if; return new; end; $$`);
+    await orm.em.getConnection().execute(`create trigger test_phase3_reject_ledger before insert on wallet_ledger_entries for each row execute function test_phase3_reject_ledger()`);
+    try {
+      await expect(wagers.process(await request(wallet.id, playerId), `rollback:${id()}`)).rejects.toThrow();
+    } finally {
+      await orm.em.getConnection().execute('drop trigger test_phase3_reject_ledger on wallet_ledger_entries');
+      await orm.em.getConnection().execute('drop function test_phase3_reject_ledger()');
+    }
+    const [counts] = await orm.em.getConnection().execute<Array<{ balance: string; wagers: string; entries: string; events: string }>>(
+      `select (select balance_amount::text from wallets where id = ?) as balance,
+       (select count(*) from wager_transactions where wallet_id = ? and external_transaction_id <> 'opening:' || ?)::text as wagers,
+       (select count(*) from wallet_ledger_entries where wallet_id = ?)::text as entries,
+       (select count(*) from outbox_messages where aggregate_id = ?)::text as events`,
+      [wallet.id, wallet.id, wallet.id, wallet.id, wallet.id]);
+    expect(counts).toEqual({ balance: '20.00', wagers: '0', entries: '1', events: '2' });
   });
 });

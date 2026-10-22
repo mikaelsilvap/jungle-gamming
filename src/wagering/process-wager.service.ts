@@ -1,0 +1,229 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { MikroORM } from '@mikro-orm/postgresql';
+import {
+  DomainError, FailureCode, LedgerDirection, Money, WagerTransaction,
+  WagerTransactionKind, WagerTransactionPendingReference, WagerTransactionProcessed,
+  WagerTransactionRejected, WagerTransactionStatus, Wallet, WalletBalanceChanged,
+} from '../domain';
+import { OutboxMessage } from '../domain/outbox-message';
+import { rehydrateWallet, rehydrateWagerTransaction } from '../persistence/rehydration';
+import { WagerTransactionRecord, WalletRecord } from '../persistence/entities';
+
+export interface ProcessWagerInput {
+  providerId: string; externalTransactionId: string; playerId: string; walletId: string;
+  roundId: string; gameId: string; kind: WagerTransactionKind; money: { amount: string; currency: string };
+  referenceExternalTransactionId?: string;
+}
+export interface WagerResult {
+  transactionId: string; status: WagerTransactionStatus; balance: { amount: string; currency: string };
+  idempotentReplay: boolean; failureCode?: FailureCode;
+}
+export class IdempotencyConflictError extends Error { readonly code = 'IDEMPOTENCY_CONFLICT'; }
+export class ExternalTransactionConflictError extends Error { readonly code = 'EXTERNAL_TRANSACTION_CONFLICT'; }
+export class WagerNotFoundError extends Error { readonly code = 'WAGER_NOT_FOUND'; }
+export class WalletNotFoundError extends Error { readonly code = 'WALLET_NOT_FOUND'; }
+export class TransientWagerPersistenceError extends Error {
+  readonly code = 'TRANSIENT_DATABASE_FAILURE';
+  constructor(cause: unknown) { super('A transient database failure prevented wager processing.', { cause }); }
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonical(object[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+function transient(error: unknown): boolean {
+  let current: unknown = error;
+  for (let i = 0; i < 5 && current && typeof current === 'object'; i += 1) {
+    if ('code' in current && ['40P01', '40001'].includes(String((current as { code: unknown }).code))) return true;
+    current = 'cause' in current ? (current as { cause?: unknown }).cause : undefined;
+  }
+  return false;
+}
+function postgresCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let i = 0; i < 5 && current && typeof current === 'object'; i += 1) {
+    if ('code' in current) return String((current as { code: unknown }).code);
+    current = 'cause' in current ? (current as { cause?: unknown }).cause : undefined;
+  }
+  return undefined;
+}
+function hashPayload(input: ProcessWagerInput): string {
+  return createHash('sha256').update(canonical(input)).digest('hex');
+}
+function resultFrom(row: WagerTransactionRecord, replay: boolean): WagerResult {
+  if (!row.resultBalanceAmount || !row.resultCurrency) throw new Error('Wager response snapshot is missing.');
+  return {
+    transactionId: row.id,
+    status: row.status as WagerTransactionStatus,
+    balance: Money.from({ amount: row.resultBalanceAmount, currency: row.resultCurrency.trim() }).toJSON(),
+    idempotentReplay: replay,
+    ...(row.failureCode ? { failureCode: row.failureCode as FailureCode } : {}),
+  };
+}
+
+/** Shared transactional application use case for HTTP and future queue consumers. */
+export class ProcessWagerService {
+  constructor(private readonly orm: MikroORM) {}
+
+  async process(input: ProcessWagerInput, idempotencyKey: string): Promise<WagerResult> {
+    const payloadHash = hashPayload(input);
+    if (input.money.amount.split('.')[0]!.replace(/^0+/, '').length > 36) {
+      throw new DomainError(FailureCode.InvalidMoney, 'Amount exceeds PostgreSQL NUMERIC(38,2) capacity.');
+    }
+    for (let attempt = 0; ; attempt += 1) {
+      try { return await this.processOnce(input, idempotencyKey, payloadHash); }
+      catch (error) {
+        if (postgresCode(error) === '23505') {
+          const [sameKey] = await this.orm.em.getConnection().execute<WagerTransactionRecord[]>(
+            `select ${wagerColumns} from wager_transactions where provider_id = ? and idempotency_key = ?`, [input.providerId, idempotencyKey]);
+          if (sameKey) {
+            if (sameKey.payloadHash.trim() !== payloadHash) throw new IdempotencyConflictError('Idempotency key was already used with a different payload.');
+            return resultFrom(sameKey, true);
+          }
+          const [sameExternal] = await this.orm.em.getConnection().execute<Array<{ id: string }>>(
+            'select id from wager_transactions where provider_id = ? and external_transaction_id = ?', [input.providerId, input.externalTransactionId]);
+          if (sameExternal) throw new ExternalTransactionConflictError('External transaction identifier is already in use.');
+        }
+        if (!transient(error)) throw error;
+        if (attempt >= 2) throw new TransientWagerPersistenceError(error);
+      }
+    }
+  }
+
+  private async processOnce(input: ProcessWagerInput, idempotencyKey: string, payloadHash: string): Promise<WagerResult> {
+    const now = new Date();
+    return this.orm.em.transactional(async (em) => {
+      const [walletRow] = await em.execute<WalletRecord[]>(
+        `select id, player_id as "playerId", currency, balance_amount::text as "balanceAmount", version,
+          created_at as "createdAt", updated_at as "updatedAt" from wallets where id = ? for update`, [input.walletId]);
+      if (!walletRow) throw new WalletNotFoundError();
+      if (walletRow.playerId !== input.playerId) throw new DomainError(FailureCode.ReferenceMismatch, 'Player does not own the requested wallet.');
+
+      const [existing] = await em.execute<WagerTransactionRecord[]>(
+        `select ${wagerColumns} from wager_transactions where provider_id = ? and idempotency_key = ?`, [input.providerId, idempotencyKey]);
+      if (existing) {
+        if (existing.payloadHash.trim() !== payloadHash) throw new IdempotencyConflictError('Idempotency key was already used with a different payload.');
+        return resultFrom(existing, true);
+      }
+
+      const parsedMoney = Money.from(input.money);
+      const id = randomUUID();
+      const transaction = WagerTransaction.create({
+        id, providerId: input.providerId, externalTransactionId: input.externalTransactionId,
+        idempotencyKey, payloadHash, walletId: input.walletId, playerId: input.playerId,
+        roundId: input.roundId, gameId: input.gameId, kind: input.kind, money: parsedMoney,
+        ...(input.referenceExternalTransactionId ? { referenceExternalTransactionId: input.referenceExternalTransactionId } : {}), createdAt: now,
+      });
+      const wallet = rehydrateWallet({
+        ...walletRow,
+        createdAt: walletRow.createdAt instanceof Date ? walletRow.createdAt : new Date(walletRow.createdAt),
+        updatedAt: walletRow.updatedAt instanceof Date ? walletRow.updatedAt : new Date(walletRow.updatedAt),
+      });
+      await em.execute(
+        `insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+          wallet_id, player_id, round_id, game_id, kind, amount, currency, reference_external_transaction_id,
+          status, created_at, pending_attempts)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, 0)`,
+        [id, input.providerId, input.externalTransactionId, idempotencyKey, payloadHash, input.walletId, input.playerId,
+          input.roundId, input.gameId, input.kind, parsedMoney.toJSON().amount, parsedMoney.currency,
+          input.referenceExternalTransactionId ?? null, now]);
+
+      let reference: WagerTransaction | undefined;
+      let alreadyReversed = false;
+      if (input.referenceExternalTransactionId) {
+        const [referenceRow] = await em.execute<WagerTransactionRecord[]>(
+          `select ${wagerColumns} from wager_transactions where provider_id = ? and external_transaction_id = ? for update`,
+          [input.providerId, input.referenceExternalTransactionId]);
+        if (referenceRow) {
+          reference = rehydrateWagerTransaction({
+            ...referenceRow,
+            createdAt: referenceRow.createdAt instanceof Date ? referenceRow.createdAt : new Date(referenceRow.createdAt),
+            ...(referenceRow.processedAt === undefined ? {} : {
+              processedAt: referenceRow.processedAt instanceof Date ? referenceRow.processedAt : new Date(referenceRow.processedAt),
+            }),
+          });
+          const [reversal] = await em.execute<Array<{ present: boolean }>>(
+            `select exists(select 1 from wager_transactions where reference_transaction_id = ? and kind = ? and status = 'PROCESSED') as present`,
+            [referenceRow.id, input.kind]);
+          alreadyReversed = reversal?.present ?? false;
+        }
+      }
+      try {
+        if (transaction.requiresReference() && !reference) {
+          transaction.markPendingReference();
+        } else {
+          const before = wallet.balance;
+          const ledger = wallet.applyWager(transaction, { id: randomUUID() }, reference, now, alreadyReversed);
+          if (ledger) {
+            await em.execute(`update wallets set balance_amount = ?, version = ?, updated_at = ? where id = ?`,
+              [wallet.balance.toJSON().amount, wallet.version, wallet.updatedAt, wallet.id]);
+            await em.execute(
+              `insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+               values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [ledger.id, ledger.walletId, ledger.transactionId, ledger.direction, ledger.money.toJSON().amount,
+                ledger.money.currency, ledger.balanceBefore.toJSON().amount, ledger.balanceAfter.toJSON().amount, ledger.createdAt]);
+          }
+          const response = { amount: wallet.balance.toJSON().amount, currency: wallet.currency };
+          await em.execute(`update wager_transactions set status = ?, reference_transaction_id = ?, processed_at = ?,
+            result_balance_amount = ?, result_currency = ? where id = ?`,
+          [transaction.status, transaction.referenceTransactionId ?? null, transaction.processedAt ?? null, response.amount, response.currency, id]);
+          if (transaction.status === WagerTransactionStatus.Processed) {
+            await this.enqueue(em, WagerTransactionProcessed.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+          }
+          if (ledger) await this.enqueue(em, WalletBalanceChanged.from(wallet, ledger, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+          if (transaction.status === WagerTransactionStatus.PendingReference) {
+            await this.enqueue(em, WagerTransactionPendingReference.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+          }
+          return { transactionId: id, status: transaction.status, balance: response, idempotentReplay: false };
+        }
+      } catch (error) {
+        if (!(error instanceof DomainError)) throw error;
+        transaction.reject(error.code);
+      }
+
+      const response = { amount: wallet.balance.toJSON().amount, currency: wallet.currency };
+      await em.execute(`update wager_transactions set status = ?, failure_code = ?, result_balance_amount = ?, result_currency = ? where id = ?`,
+        [transaction.status, transaction.failureCode ?? null, response.amount, response.currency, id]);
+      if (transaction.status === WagerTransactionStatus.Rejected) {
+        await this.enqueue(em, WagerTransactionRejected.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+      }
+      if (transaction.status === WagerTransactionStatus.PendingReference) {
+        await this.enqueue(em, WagerTransactionPendingReference.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+      }
+      return { transactionId: id, status: transaction.status, balance: response, idempotentReplay: false,
+        ...(transaction.failureCode ? { failureCode: transaction.failureCode } : {}) };
+    });
+  }
+
+  private async enqueue(em: { execute: (sql: string, params?: unknown[]) => Promise<unknown> }, event: { eventId: string; aggregateId: string; eventType: string; occurredAt: Date; toJSON: () => Record<string, unknown> }): Promise<void> {
+    const outbox = OutboxMessage.enqueue(event as never);
+    await em.execute(`insert into outbox_messages (id, aggregate_id, event_type, payload, occurred_at, attempts)
+      values (?, ?, ?, ?::jsonb, ?, 0)`,
+      [outbox.id, outbox.aggregateId, outbox.eventType, JSON.stringify(outbox.payload), outbox.occurredAt]);
+  }
+
+  async getById(id: string): Promise<WagerResult | null> {
+    const [row] = await this.orm.em.getConnection().execute<WagerTransactionRecord[]>(
+      `select ${wagerColumns} from wager_transactions where id = ? and kind <> 'OPENING'`, [id]);
+    return row ? resultFrom(row, false) : null;
+  }
+
+  async getByExternal(providerId: string, externalId: string): Promise<WagerResult | null> {
+    const [row] = await this.orm.em.getConnection().execute<WagerTransactionRecord[]>(
+      `select ${wagerColumns} from wager_transactions where provider_id = ? and external_transaction_id = ? and kind <> 'OPENING'`, [providerId, externalId]);
+    return row ? resultFrom(row, false) : null;
+  }
+}
+
+const wagerColumns = `id, provider_id as "providerId", external_transaction_id as "externalTransactionId",
+  idempotency_key as "idempotencyKey", payload_hash as "payloadHash", wallet_id as "walletId",
+  player_id as "playerId", round_id as "roundId", game_id as "gameId", kind,
+  amount::text as amount, currency, reference_external_transaction_id as "referenceExternalTransactionId",
+  reference_transaction_id as "referenceTransactionId", status, failure_code as "failureCode",
+  result_balance_amount::text as "resultBalanceAmount", result_currency as "resultCurrency",
+  processed_at as "processedAt", created_at as "createdAt", pending_attempts as "pendingAttempts",
+  next_attempt_at as "nextAttemptAt"`;

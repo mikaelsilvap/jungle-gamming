@@ -1,6 +1,7 @@
 import { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
 import { Wallet } from '../../domain/wallet';
 import { WagerTransaction } from '../../domain/wager-transaction';
+import { OutboxMessage } from '../../domain/outbox-message';
 
 export interface WalletResponse {
   id: string;
@@ -25,7 +26,7 @@ export interface WalletReconciliation {
 
 /** Application port. The adapter must persist every supplied record atomically. */
 export interface WalletPersistencePort {
-  createAtomically(wallet: Wallet, openingTransaction?: WagerTransaction, openingLedger?: WalletLedgerEntry): Promise<void>;
+  createAtomically(wallet: Wallet, openingTransaction?: WagerTransaction, openingLedger?: WalletLedgerEntry, outbox?: readonly OutboxMessage[]): Promise<void>;
   getWallet(walletId: string): Promise<WalletResponse | null>;
   listLedger(walletId: string, cursor: string | undefined, limit: number): Promise<LedgerPage | null>;
   reconcile(walletId: string): Promise<WalletReconciliation | null>;

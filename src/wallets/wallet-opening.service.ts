@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Money, Wallet, WagerTransaction } from '../domain';
+import { Money, Wallet, WagerTransaction, WagerTransactionProcessed, WalletBalanceChanged, OutboxMessage } from '../domain';
 import {
   AmountExceedsStorageLimitError,
   LedgerPage,
@@ -46,7 +46,12 @@ export class WalletOpeningService {
       openingTransaction.markProcessed(undefined, now);
       const openingLedger = wallet.createOpeningLedgerEntry(randomUUID(), transactionId, now);
       if (!openingLedger) throw new Error('Positive wallet opening did not produce a ledger entry.');
-      await this.persistence.createAtomically(wallet, openingTransaction, openingLedger);
+      const context = () => ({ eventId: randomUUID(), correlationId: transactionId, causationId: transactionId, occurredAt: now });
+      const outbox = [
+        OutboxMessage.enqueue(WagerTransactionProcessed.from(openingTransaction, context())),
+        OutboxMessage.enqueue(WalletBalanceChanged.from(wallet, openingLedger, context())),
+      ];
+      await this.persistence.createAtomically(wallet, openingTransaction, openingLedger, outbox);
     } else {
       await this.persistence.createAtomically(wallet);
     }

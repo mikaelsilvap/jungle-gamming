@@ -1,5 +1,5 @@
 import { MikroORM } from '@mikro-orm/postgresql';
-import { LedgerDirection, Money, Wallet, WalletLedgerEntry, WagerTransaction } from '../domain';
+import { LedgerDirection, Money, OutboxMessage, Wallet, WalletLedgerEntry, WagerTransaction } from '../domain';
 import {
   LedgerPage,
   InvalidLedgerCursorError,
@@ -22,7 +22,7 @@ function isUniqueViolation(error: unknown): boolean {
 export class WalletPostgresAdapter implements WalletPersistencePort {
   constructor(private readonly orm: MikroORM) {}
 
-  async createAtomically(wallet: Wallet, openingTransaction?: WagerTransaction, openingLedger?: WalletLedgerEntry): Promise<void> {
+  async createAtomically(wallet: Wallet, openingTransaction?: WagerTransaction, openingLedger?: WalletLedgerEntry, outbox: readonly OutboxMessage[] = []): Promise<void> {
     if ((openingTransaction === undefined) !== (openingLedger === undefined)) {
       throw new Error('Opening transaction and ledger entry must be persisted together.');
     }
@@ -56,6 +56,13 @@ export class WalletPostgresAdapter implements WalletPersistencePort {
               openingLedger.money.toJSON().amount, openingLedger.money.currency,
               openingLedger.balanceBefore.toJSON().amount, openingLedger.balanceAfter.toJSON().amount,
               openingLedger.createdAt],
+          );
+        }
+        for (const message of outbox) {
+          await em.execute(
+            `insert into outbox_messages (id, aggregate_id, event_type, payload, occurred_at, attempts)
+             values (?, ?, ?, ?::jsonb, ?, ?)`,
+            [message.id, message.aggregateId, message.eventType, JSON.stringify(message.payload), message.occurredAt, message.attempts],
           );
         }
       });
