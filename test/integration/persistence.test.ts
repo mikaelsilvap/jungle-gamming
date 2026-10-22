@@ -346,6 +346,9 @@ describe('PostgreSQL wagering phase 3', () => {
       money: { amount: '10.00', currency: 'BRL' },
     });
     expect((await wagers.process(rollbackInput, `rollback:${id()}`)).status).toBe(WagerTransactionStatus.Processed);
+    const repeatedRollback = await wagers.process({ ...rollbackInput, externalTransactionId: id() }, `rollback-again:${id()}`);
+    expect(repeatedRollback.status).toBe(WagerTransactionStatus.Rejected);
+    expect(repeatedRollback.failureCode).toBe(FailureCode.ReferenceAlreadyReversed);
     const duplicateRefundInput = { ...refundInput, externalTransactionId: id() };
     const duplicateRefund = await wagers.process(duplicateRefundInput, `refund-duplicate:${id()}`);
     expect(duplicateRefund.status).toBe(WagerTransactionStatus.Rejected);
