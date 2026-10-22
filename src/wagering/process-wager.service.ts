@@ -59,13 +59,15 @@ function resultFrom(row: WagerTransactionRecord, replay: boolean, originalSnapsh
   const status = originalSnapshot ? row.responseSnapshotStatus ?? row.status : row.status;
   const balanceAmount = originalSnapshot ? row.responseSnapshotBalanceAmount ?? row.resultBalanceAmount : row.resultBalanceAmount;
   const currency = originalSnapshot ? row.responseSnapshotCurrency ?? row.resultCurrency : row.resultCurrency;
+  const failureCode = originalSnapshot && row.responseSnapshotStatus
+    ? row.responseSnapshotFailureCode : row.failureCode;
   if (!balanceAmount || !currency) throw new Error('Wager response snapshot is missing.');
   return {
     transactionId: row.id,
     status: status as WagerTransactionStatus,
     balance: Money.from({ amount: balanceAmount, currency: currency.trim() }).toJSON(),
     idempotentReplay: replay,
-    ...(row.failureCode ? { failureCode: row.failureCode as FailureCode } : {}),
+    ...(failureCode ? { failureCode: failureCode as FailureCode } : {}),
   };
 }
 
@@ -177,10 +179,10 @@ export class ProcessWagerService {
           }
           const response = { amount: wallet.balance.toJSON().amount, currency: wallet.currency };
           await em.execute(`update wager_transactions set status = ?, reference_transaction_id = ?, processed_at = ?,
-            result_balance_amount = ?, result_currency = ?, response_snapshot_status = ?,
+            result_balance_amount = ?, result_currency = ?, response_snapshot_status = ?, response_snapshot_failure_code = ?,
             response_snapshot_balance_amount = ?, response_snapshot_currency = ? where id = ?`,
           [transaction.status, transaction.referenceTransactionId ?? null, transaction.processedAt ?? null,
-            response.amount, response.currency, transaction.status, response.amount, response.currency, id]);
+            response.amount, response.currency, transaction.status, transaction.failureCode ?? null, response.amount, response.currency, id]);
           if (transaction.status === WagerTransactionStatus.Processed) {
             await this.enqueue(em, WagerTransactionProcessed.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
           }
@@ -200,10 +202,10 @@ export class ProcessWagerService {
       const expiresAt = pending ? this.referenceRetryPolicy.expiresAt(now) : null;
       const nextAttemptAt = pending ? this.referenceRetryPolicy.initialAttemptAt(now) : null;
       await em.execute(`update wager_transactions set status = ?, failure_code = ?, result_balance_amount = ?, result_currency = ?,
-        response_snapshot_status = ?, response_snapshot_balance_amount = ?, response_snapshot_currency = ?,
+        response_snapshot_status = ?, response_snapshot_failure_code = ?, response_snapshot_balance_amount = ?, response_snapshot_currency = ?,
         next_attempt_at = ?, reference_expires_at = ?, claimed_by = null, locked_until = null where id = ?`,
         [transaction.status, transaction.failureCode ?? null, response.amount, response.currency,
-          transaction.status, response.amount, response.currency, nextAttemptAt, expiresAt, id]);
+          transaction.status, transaction.failureCode ?? null, response.amount, response.currency, nextAttemptAt, expiresAt, id]);
       if (transaction.status === WagerTransactionStatus.Rejected) {
         await this.enqueue(em, WagerTransactionRejected.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
       }
@@ -376,6 +378,7 @@ const wagerColumns = `id, provider_id as "providerId", external_transaction_id a
   reference_transaction_id as "referenceTransactionId", status, failure_code as "failureCode",
   result_balance_amount::text as "resultBalanceAmount", result_currency as "resultCurrency",
   response_snapshot_status as "responseSnapshotStatus",
+  response_snapshot_failure_code as "responseSnapshotFailureCode",
   response_snapshot_balance_amount::text as "responseSnapshotBalanceAmount",
   response_snapshot_currency as "responseSnapshotCurrency",
   processed_at as "processedAt", created_at as "createdAt", pending_attempts as "pendingAttempts",

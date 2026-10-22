@@ -31,6 +31,7 @@ export class WagerTransactionRecord {
   resultBalanceAmount?: string;
   resultCurrency?: string;
   responseSnapshotStatus?: string;
+  responseSnapshotFailureCode?: string;
   responseSnapshotBalanceAmount?: string;
   responseSnapshotCurrency?: string;
   processedAt?: Date;
@@ -106,6 +107,7 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     resultBalanceAmount: { ...numeric, fieldName: 'result_balance_amount', nullable: true },
     resultCurrency: { type: 'char', length: 3, fieldName: 'result_currency', nullable: true },
     responseSnapshotStatus: { ...text, fieldName: 'response_snapshot_status', nullable: true },
+    responseSnapshotFailureCode: { ...text, fieldName: 'response_snapshot_failure_code', nullable: true },
     responseSnapshotBalanceAmount: { ...numeric, fieldName: 'response_snapshot_balance_amount', nullable: true },
     responseSnapshotCurrency: { type: 'char', length: 3, fieldName: 'response_snapshot_currency', nullable: true },
     processedAt: { ...timestamp, fieldName: 'processed_at', nullable: true }, createdAt: { ...timestamp, fieldName: 'created_at' },

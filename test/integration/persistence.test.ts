@@ -550,6 +550,10 @@ describe('PostgreSQL pending-reference worker phase 4', () => {
       [missing.result.transactionId]);
     expect((await worker.runOnce()).rejected).toBe(1);
     expect((await wagers.getById(missing.result.transactionId))?.failureCode).toBe(FailureCode.ReferenceExpired);
+    const originalReplay = await wagers.process(missing.input, missing.key);
+    expect(originalReplay.status).toBe(WagerTransactionStatus.PendingReference);
+    expect(originalReplay.failureCode).toBeUndefined();
+    expect(originalReplay.balance.amount).toBe('100.00');
     const [events] = await orm.em.getConnection().execute<Array<{ pending: string; rejected: string; ledger: string }>>(
       `select (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionPendingReference')::text as pending,
         (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionRejected')::text as rejected,
