@@ -259,6 +259,7 @@ describe('WagerTransaction', () => {
     const originalBet = processedWager({ id: 'original-bet', externalTransactionId: 'original-bet', idempotencyKey: 'original-bet-key' });
     const refundForRollback = reversal(WagerTransactionKind.Refund, originalBet);
     refundForRollback.markProcessed(originalBet, now);
+    expectCode(() => reversal(WagerTransactionKind.Refund, originalBet).validateReference(originalBet), FailureCode.ReferenceAlreadyReversed);
     const rollbackRefund = reversal(WagerTransactionKind.Rollback, refundForRollback);
     const rollbackRefundEntry = wallet.applyWager(rollbackRefund, { id: 'entry-4' }, refundForRollback, now);
     expect(rollbackRefundEntry?.direction).toBe(LedgerDirection.Debit);

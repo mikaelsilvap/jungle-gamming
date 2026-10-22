@@ -27,12 +27,12 @@ Status: complete for the in-memory domain scope.
 
 - Added an independent domain module with immutable exact `Money`, `Wallet`, `WagerTransaction`, immutable `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage`, stable failure codes, and the four required integration events.
 - Wallet credits, debits, and wager application create a mathematically consistent ledger entry; LOSS changes no balance or version; positive wallet opening creates at most one opening ledger entry per domain instance.
-- Wager rules cover BET, WIN (including optional processed BET reference), LOSS, REFUND, and ROLLBACK; invalid references, duplicate same-kind reversals supplied by the caller, mismatched amounts, and rollback overdraw have distinct domain outcomes.
+- Wager rules cover BET, WIN (including optional processed BET reference), LOSS, REFUND, and ROLLBACK; invalid references, repeated same-kind reversals on the same reference object, mismatched amounts, and rollback overdraw have distinct domain outcomes.
 - Added 34 unit tests and configured `tsconfig.test.json` so both the domain and tests are typechecked.
-- `bun test`: PASS, 34 tests and 143 expectations.
+- `bun test`: PASS, 34 tests and 145 expectations.
 - `bun run typecheck`: PASS for application and test TypeScript.
 - `bun run build`: PASS.
-- Unit tests prove local domain invariants only. They do not prove persistence, uniqueness across processes, crash recovery, or SQS/PostgreSQL behavior.
+- Unit tests prove local domain invariants only. They do not prove persistent uniqueness across processes, crash recovery, or SQS/PostgreSQL behavior; database uniqueness remains required in later phases.
 
 Commit: `feat(domain): implement precise money and wagering invariants`.
 

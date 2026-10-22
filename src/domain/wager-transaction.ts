@@ -20,6 +20,7 @@ export interface CreateWagerTransactionProps {
 
 export interface WagerTransactionState extends CreateWagerTransactionProps {
   status: WagerTransactionStatus;
+  reversedByKinds?: WagerTransactionKind[];
   referenceTransactionId?: string;
   failureCode?: FailureCode;
   processedAt?: Date;
@@ -31,6 +32,7 @@ export class WagerTransaction {
   private _referenceTransactionId: string | undefined;
   private _failureCode: FailureCode | undefined;
   private processedAtMs: number | undefined;
+  private readonly reversalKinds = new Set<WagerTransactionKind>();
 
   private constructor(
     public readonly id: string,
@@ -50,12 +52,14 @@ export class WagerTransaction {
     referenceTransactionId?: string,
     failureCode?: FailureCode,
     processedAt?: Date,
+    reversedByKinds: readonly WagerTransactionKind[] = [],
   ) {
     this.createdAtMs = createdAt.getTime();
     this._status = status;
     this._referenceTransactionId = referenceTransactionId;
     this._failureCode = failureCode;
     this.processedAtMs = processedAt?.getTime();
+    for (const kind of reversedByKinds) this.reversalKinds.add(kind);
   }
 
   static create(props: CreateWagerTransactionProps): WagerTransaction {
@@ -136,6 +140,7 @@ export class WagerTransaction {
       state.referenceTransactionId,
       state.failureCode,
       state.processedAt,
+      state.reversedByKinds,
     );
   }
 
@@ -166,6 +171,7 @@ export class WagerTransaction {
       }
       this._referenceTransactionId = reference.id;
     }
+    if (reference && this.requiresReference()) reference.reversalKinds.add(this.kind);
     this._status = WagerTransactionStatus.Processed;
     this.processedAtMs = at.getTime();
   }
@@ -239,6 +245,9 @@ export class WagerTransaction {
       fail(FailureCode.ReferenceKindNotAllowed, `${this.kind} cannot reverse ${reference.kind}.`);
     }
     if (alreadyReversedBySameKind) {
+      fail(FailureCode.ReferenceAlreadyReversed, `This transaction has already been reversed by ${this.kind}.`);
+    }
+    if (reference.reversalKinds.has(this.kind)) {
       fail(FailureCode.ReferenceAlreadyReversed, `This transaction has already been reversed by ${this.kind}.`);
     }
     if (!this.money.equals(reference.money)) {
