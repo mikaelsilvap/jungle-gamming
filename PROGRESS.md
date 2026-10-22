@@ -86,6 +86,22 @@ Status: implementation and local validation complete for pending-reference recov
 - Worker concurrency and crash recovery: two independent worker processes contended for one due row; PostgreSQL showed one lease owner. Both processes were killed during the test-only post-claim pause. After the persisted lease expired, the normal Compose worker reclaimed the row, advanced attempts from 1 to 2, rescheduled it, cleared the lease, and kept the row `PENDING_REFERENCE`; no ledger row or duplicate pending event was created.
 - A real missing-reference row was used for the worker crash/restart proof and remains pending in the local development database. It is test data, not application fixture data.
 
+## Phase 5 — SQS consumer, Inbox, retry, and DLQ
+
+Status: implementation complete; PostgreSQL and LocalStack integration gate passed. Operational SIGTERM and independent-process restart scenarios are recorded separately below.
+
+- Added an AWS SDK v3 standalone FIFO consumer and Compose service. It long-polls the command queue, validates the README envelope, uses a stable consumer identity, renews visibility while processing, and drains active work on SIGTERM.
+- Extended the existing shared `ProcessWagerService` with an Inbox-aware entry point. Inbox identity, canonical full-envelope SHA-256, financial transaction, wallet/ledger changes, response state, and outbox events are finalized in the same PostgreSQL transaction. The HTTP processing contract remains unchanged.
+- Matching processed-message redelivery is acknowledged without repeating financial work. Same message ID with a different payload is rejected durably only by retry/DLQ (no Inbox completion or financial effects). Distinct message IDs for the same provider operation rely on existing persistent business idempotency.
+- Durable business rejection and pending-reference acceptance are acknowledged after commit. The pending-reference worker later resumes the operation. Transient failures use exponential SQS visibility (1 second base, capped at 30 seconds); permanent invalid messages use the queue's native redrive policy (`maxReceiveCount=5`). Command queue visibility is 60 seconds, with long polling at 20 seconds and a heartbeat during processing. Messages within one FIFO group remain ordered; different groups can progress concurrently.
+- Added real PostgreSQL + LocalStack FIFO integration coverage for valid messages, repeated message IDs, business idempotency across message IDs, divergent payload, insufficient funds, same-wallet competition, independent wallets, pending reference recovery, PostgreSQL serialization retry, post-commit DeleteMessage failure/redelivery, and poison message DLQ.
+- Added real-queue integration cases for two independent consumer instances processing separate FIFO groups and for stopping/draining a committed in-flight delivery.
+- Final `bun test` against Docker PostgreSQL 17 and LocalStack 4.12.0: PASS, 73 tests / 317 expectations, including all domain, persistence, wagering, pending-reference, and SQS cases. A first unrestricted `bun test` attempt was refused because it targeted the development database; the safety guard prevented any test from running there, and the rerun with the explicitly disposable database passed.
+- `bun run typecheck`: PASS; `bun run build`: PASS; `docker compose config --quiet`: PASS; `docker compose build sqs-consumer`: PASS; `git diff --check`: PASS.
+- Started the compiled `sqs-consumer` Compose service and stopped it with Docker's SIGTERM path; logs confirmed ORM startup and `wager_sqs_shutdown_complete`. The in-flight drain behavior was also exercised with a real SQS delivery and PostgreSQL Inbox commit by stopping the consumer loop while the post-commit pause was active; it acknowledged the message and left one reconciled financial effect.
+- Restarted LocalStack to execute `localstack/init/ready.d/10-create-wager-queues.sh`; the init log ended with `Ready.` and queue inspection confirmed visibility 60 seconds and redrive to the FIFO DLQ at five receives.
+- No outbox publisher, SNS, dashboard, frontend, authentication, Kubernetes, or Terraform was added. Outbox publication remains Phase 6.
+
 ## Later phases
 
 Not started. See `implementationPlan.md` in the local workspace; it is intentionally excluded from the evaluation repository.

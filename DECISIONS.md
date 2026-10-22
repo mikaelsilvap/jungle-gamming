@@ -8,7 +8,7 @@ Use Bun 1.4.3, TypeScript strict mode, and NestJS 11, as required by the challen
 
 ## ADR-002 — Process and module shape
 
-Status: proposed; financial processes are not implemented yet.
+Status: accepted; API, pending-reference worker, and SQS consumer are implemented as independently runnable processes.
 
 Start as a modular monolith with independently runnable API, SQS consumer, outbox publisher, and pending-reference worker. Share application use cases and PostgreSQL persistence across processes; avoid introducing network services between these components.
 
@@ -26,7 +26,7 @@ Serialize operations on one existing wallet using a PostgreSQL row lock (`SELECT
 
 ## ADR-005 — Financial atomicity and ledger
 
-Status: accepted and implemented for wallet opening and Phase 3 wagers. Financial result, balance, optional ledger, and outbox writes commit together; SQS inbox coordination remains later work.
+Status: accepted and implemented for wallet opening, Phase 3 wagers, and Phase 5 SQS processing. Financial result, balance, optional ledger, Inbox state when applicable, and outbox writes commit together.
 
 Commit wallet, wager transaction, append-only ledger, SQS inbox when applicable, and outbox together. Publish outbox events only after commit. Enforce database constraints and ledger immutability in PostgreSQL.
 
@@ -38,9 +38,9 @@ Use unique database keys and a SHA-256 hash of recursively sorted canonical busi
 
 ## ADR-007 — HTTP and SQS share the use case
 
-Status: accepted for the HTTP adapter and future SQS adapter.
+Status: accepted and implemented for the HTTP adapter and Phase 5 SQS consumer.
 
-HTTP and SQS adapters will invoke one `ProcessWager` application use case. SQS acknowledgment follows the database commit.
+HTTP and SQS adapters invoke the shared `ProcessWagerService`; SQS does not contain financial rules. The consumer stores a canonical full-envelope SHA-256 hash keyed by stable consumer name and SQS message ID in the same PostgreSQL transaction as wager, wallet, ledger, and outbox changes. SQS acknowledgment uses the receipt handle for the current delivery and follows the database commit.
 
 ## ADR-008 — Transactional outbox and delivery
 
@@ -80,4 +80,10 @@ Status: accepted and implemented in Phase 4.
 
 Persist each pending reversal's expiry, next-attempt time, attempt count, and temporary worker lease in PostgreSQL. Workers claim batches with `FOR UPDATE SKIP LOCKED`; a lease lets another process recover work after a crash. The worker acquires the wallet lock before wager/reference locks, then reuses the domain transition and reference validation rules. Retry policy is 60-second initial delay, exponential backoff capped at 30 minutes, a 24-hour TTL, and 64 maximum attempts. Expiry and terminal failures are recorded as rejected outcomes. Reschedules do not add another pending event; final outcome, optional ledger entry, response snapshot, and outbox events commit atomically. These settings are operational defaults and can be revisited from observed provider latency.
 
-The migration backfills pre-existing pending rows with the same TTL and initial delay. The worker is a standalone local Compose process. SQS consumption and outbox publishing remain outside this phase.
+The migration backfills pre-existing pending rows with the same TTL and initial delay. The worker is a standalone local Compose process. The worker holds the pending-row lock during the transaction after checking lease ownership; another claimant cannot take the row while it is locked. Pending idempotency replay intentionally preserves the original acceptance snapshot, while transaction lookup reports current state.
+
+## ADR-014 — SQS Inbox, redelivery, and shutdown
+
+Status: accepted and implemented in Phase 5.
+
+Use AWS SDK for JavaScript v3 in a standalone FIFO consumer process. Long-poll the command queue, process each MessageGroupId in order, and process distinct groups concurrently. PostgreSQL wallet locks remain the financial concurrency authority; MessageGroupId is an ordering and throughput aid. Use a stable consumer name and `(consumer_name,message_id)` Inbox identity with canonical full-envelope SHA-256 validation. A matching completed Inbox row is a durable duplicate; a divergent payload for the same identity is permanently invalid. Commit Inbox, wager result, balance, optional ledger, and outbox in one SQL transaction. ACK only after commit, including durable business rejections and pending references. Transient errors receive bounded exponential visibility delay; permanent invalid messages are retried only until the queue RedrivePolicy moves them to the FIFO DLQ (`maxReceiveCount=5`). Renew message visibility during processing. SIGTERM stops new polling and drains active work; a post-commit crash is recovered through Inbox deduplication on redelivery. The outbox publisher remains Phase 6.
