@@ -10,6 +10,8 @@ import { InboxMessage } from '../domain/inbox-message';
 import { rehydrateWallet, rehydrateWagerTransaction } from '../persistence/rehydration';
 import { WagerTransactionRecord, WalletRecord } from '../persistence/entities';
 import { ReferenceRetryPolicy } from './reference-retry-policy';
+import { currentLogContext, logEvent } from '../observability/logger';
+import { metrics } from '../observability/metrics';
 
 export interface ProcessWagerInput {
   providerId: string; externalTransactionId: string; playerId: string; walletId: string;
@@ -92,13 +94,32 @@ export class ProcessWagerService {
   }
 
   private async execute(input: ProcessWagerInput, idempotencyKey: string, inbox?: WagerInboxContext): Promise<WagerResult | InboxWagerResult> {
+    const startedAt = performance.now();
     const payloadHash = hashPayload(input);
+    if (!inbox) logEvent('wagering', 'wager_processing_started', { walletId: input.walletId, providerId: input.providerId, kind: input.kind });
     if (input.money.amount.split('.')[0]!.replace(/^0+/, '').length > 36) {
       throw new DomainError(FailureCode.InvalidMoney, 'Amount exceeds PostgreSQL NUMERIC(38,2) capacity.');
     }
     for (let attempt = 0; ; attempt += 1) {
-      try { return await this.processOnce(input, idempotencyKey, payloadHash, inbox); }
+      try {
+        const result = await this.processOnce(input, idempotencyKey, payloadHash, inbox);
+        const durationSeconds = Math.max(0, performance.now() - startedAt) / 1_000;
+        metrics.observe('wager_processing_duration_seconds', durationSeconds, { kind: input.kind });
+        if ('duplicate' in result) {
+          if (result.duplicate) {
+            metrics.increment('wager_duplicates_total', { operation: 'inbox' });
+            logEvent('wagering', 'wager_duplicate_detected', { walletId: input.walletId, providerId: input.providerId,
+              ...(inbox ? { messageId: inbox.messageId } : {}) });
+          } else this.recordResult(result.result, input, Math.round((performance.now() - startedAt) * 100) / 100);
+        } else this.recordResult(result, input, Math.round((performance.now() - startedAt) * 100) / 100);
+        return result;
+      }
       catch (error) {
+        if (error instanceof IdempotencyConflictError) {
+          metrics.increment('wager_idempotency_conflicts_total');
+          logEvent('wagering', 'wager_idempotency_conflict', { walletId: input.walletId, providerId: input.providerId,
+            ...(inbox ? { messageId: inbox.messageId } : {}), errorCode: error.code }, 'warn');
+        }
         if (postgresCode(error) === '23505') {
           if (inbox && attempt < 2) continue;
           if (inbox) throw new InboxMessageConflictError('The message conflicts with an already persisted business operation.');
@@ -113,14 +134,32 @@ export class ProcessWagerService {
           if (sameExternal) throw new ExternalTransactionConflictError('External transaction identifier is already in use.');
         }
         if (!transient(error)) throw error;
+        metrics.increment('wager_transaction_retries_total');
+        metrics.increment('wager_lock_conflicts_total', { outcome: postgresCode(error) === '40P01' ? 'deadlock' : 'serialization' });
+        logEvent('wagering', 'wager_transaction_retry_scheduled', { walletId: input.walletId, providerId: input.providerId,
+          attempt: attempt + 1, errorCode: postgresCode(error) });
         if (attempt >= 2) throw new TransientWagerPersistenceError(error);
       }
     }
   }
 
+  private recordResult(result: WagerResult, input: ProcessWagerInput, durationMs: number): void {
+    if (result.idempotentReplay) {
+      metrics.increment('wager_duplicates_total', { operation: 'idempotency' });
+      logEvent('wagering', 'wager_duplicate_detected', { transactionId: result.transactionId, walletId: input.walletId,
+        providerId: input.providerId });
+    }
+    if (!result.idempotentReplay) metrics.increment('wager_transactions_total', { status: result.status, kind: input.kind });
+    logEvent('wagering', result.status === WagerTransactionStatus.Rejected ? 'wager_processing_rejected' : 'wager_processing_completed', {
+      transactionId: result.transactionId, walletId: input.walletId, providerId: input.providerId, status: result.status,
+      kind: input.kind, errorCode: result.failureCode, durationMs,
+    }, result.status === WagerTransactionStatus.Rejected ? 'warn' : 'info');
+  }
+
   private async processOnce(input: ProcessWagerInput, idempotencyKey: string, payloadHash: string,
     inbox?: WagerInboxContext): Promise<WagerResult | InboxWagerResult> {
     const now = this.clock();
+    const correlationId = currentLogContext().correlationId;
     return this.orm.em.transactional(async (em) => {
       let inboxMessage: InboxMessage | undefined;
       if (inbox) {
@@ -228,11 +267,11 @@ export class ProcessWagerService {
           [transaction.status, transaction.referenceTransactionId ?? null, transaction.processedAt ?? null,
             response.amount, response.currency, transaction.status, transaction.failureCode ?? null, response.amount, response.currency, id]);
           if (transaction.status === WagerTransactionStatus.Processed) {
-            await this.enqueue(em, WagerTransactionProcessed.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+            await this.enqueue(em, WagerTransactionProcessed.from(transaction, { eventId: randomUUID(), correlationId: correlationId ?? id, causationId: id, occurredAt: now }));
           }
-          if (ledger) await this.enqueue(em, WalletBalanceChanged.from(wallet, ledger, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+          if (ledger) await this.enqueue(em, WalletBalanceChanged.from(wallet, ledger, { eventId: randomUUID(), correlationId: correlationId ?? id, causationId: id, occurredAt: now }));
           if (transaction.status === WagerTransactionStatus.PendingReference) {
-            await this.enqueue(em, WagerTransactionPendingReference.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+            await this.enqueue(em, WagerTransactionPendingReference.from(transaction, { eventId: randomUUID(), correlationId: correlationId ?? id, causationId: id, occurredAt: now }));
           }
           return await finish({ transactionId: id, status: transaction.status, balance: response, idempotentReplay: false });
         }
@@ -251,10 +290,10 @@ export class ProcessWagerService {
         [transaction.status, transaction.failureCode ?? null, response.amount, response.currency,
           transaction.status, transaction.failureCode ?? null, response.amount, response.currency, nextAttemptAt, expiresAt, id]);
       if (transaction.status === WagerTransactionStatus.Rejected) {
-        await this.enqueue(em, WagerTransactionRejected.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+        await this.enqueue(em, WagerTransactionRejected.from(transaction, { eventId: randomUUID(), correlationId: correlationId ?? id, causationId: id, occurredAt: now }));
       }
       if (transaction.status === WagerTransactionStatus.PendingReference) {
-        await this.enqueue(em, WagerTransactionPendingReference.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
+        await this.enqueue(em, WagerTransactionPendingReference.from(transaction, { eventId: randomUUID(), correlationId: correlationId ?? id, causationId: id, occurredAt: now }));
       }
       return await finish({ transactionId: id, status: transaction.status, balance: response, idempotentReplay: false,
         ...(transaction.failureCode ? { failureCode: transaction.failureCode } : {}) });
@@ -285,6 +324,7 @@ export class ProcessWagerService {
 
   /** Resumes an existing pending row without entering the HTTP idempotency path. */
   async resumePending(transactionId: string, workerId: string, now: Date): Promise<'processed' | 'rejected' | 'rescheduled' | 'skipped'> {
+    const correlationId = currentLogContext().correlationId ?? transactionId;
     const [snapshot] = await this.orm.em.getConnection().execute<Array<{ walletId: string }>>(
       `select wallet_id as "walletId" from wager_transactions where id = ?`, [transactionId]);
     if (!snapshot) return 'skipped';
@@ -345,7 +385,7 @@ export class ProcessWagerService {
             result_balance_amount = ?, result_currency = ? where id = ?`,
           [transaction.status, code, attempt, wallet.balance.toJSON().amount, wallet.currency, transactionId]);
           await this.enqueue(em, WagerTransactionRejected.from(transaction, {
-            eventId: randomUUID(), correlationId: transactionId, causationId: transactionId, occurredAt: now,
+            eventId: randomUUID(), correlationId, causationId: transactionId, occurredAt: now,
           }));
           return 'rejected';
       }
@@ -381,7 +421,7 @@ export class ProcessWagerService {
         attempt, wallet.balance.toJSON().amount, wallet.currency, transactionId]);
       if (transaction.status === WagerTransactionStatus.Processed) {
         await this.enqueue(em, WagerTransactionProcessed.from(transaction, {
-          eventId: randomUUID(), correlationId: transactionId, causationId: transactionId, occurredAt: now,
+          eventId: randomUUID(), correlationId, causationId: transactionId, occurredAt: now,
         }));
       } else {
         await this.enqueue(em, WagerTransactionRejected.from(transaction, {
@@ -389,7 +429,7 @@ export class ProcessWagerService {
         }));
       }
       if (ledger) await this.enqueue(em, WalletBalanceChanged.from(wallet, ledger, {
-        eventId: randomUUID(), correlationId: transactionId, causationId: transactionId, occurredAt: now,
+        eventId: randomUUID(), correlationId, causationId: transactionId, occurredAt: now,
       }));
       return transaction.status === WagerTransactionStatus.Processed ? 'processed' : 'rejected';
     });

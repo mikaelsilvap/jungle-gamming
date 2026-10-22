@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { ProcessWagerService } from './process-wager.service';
+import { logEvent, withLogContext } from '../observability/logger';
+import { metrics } from '../observability/metrics';
 
 export interface PendingWorkerSummary {
   claimed: number;
@@ -26,7 +28,7 @@ export class PendingReferenceWorker {
   async runOnce(now = this.clock()): Promise<PendingWorkerSummary> {
     const ids = await this.processor.claimPending(this.workerId, now, this.leaseMs, this.batchSize);
     if (ids.length > 0) {
-      process.stdout.write(`${JSON.stringify({ event: 'pending_reference_claimed', workerId: this.workerId, count: ids.length })}\n`);
+      logEvent('pending-reference-worker', 'pending_reference_claimed', { workerId: this.workerId, count: ids.length });
     }
     const pauseAfterClaim = process.env.WAGER_TEST_ENABLE_FAULTS === 'true'
       ? Number.parseInt(process.env.WAGER_TEST_PAUSE_AFTER_CLAIM_MS ?? '0', 10) : 0;
@@ -35,8 +37,15 @@ export class PendingReferenceWorker {
     }
     const summary: PendingWorkerSummary = { claimed: ids.length, processed: 0, rejected: 0, rescheduled: 0, skipped: 0 };
     for (const id of ids) {
-      const result = await this.processor.resumePending(id, this.workerId, this.clock());
+      const startedAt = performance.now();
+      const result = await withLogContext({ correlationId: id, transactionId: id }, () => this.processor.resumePending(id, this.workerId, this.clock()));
       summary[result] += 1;
+      metrics.increment('pending_reference_outcomes_total', { outcome: result });
+      if (result === 'rescheduled') metrics.increment('pending_reference_retries_total');
+      metrics.observe('pending_reference_processing_duration_seconds', Math.max(0, performance.now() - startedAt) / 1_000,
+        { outcome: result });
+      if (result === 'processed' || result === 'rejected') logEvent('pending-reference-worker', 'pending_reference_recovered',
+        { workerId: this.workerId, transactionId: id, status: result === 'processed' ? 'PROCESSED' : 'REJECTED' });
     }
     return summary;
   }
@@ -47,10 +56,11 @@ export class PendingReferenceWorker {
       if (this.active) return;
       this.active = true;
       void this.runOnce().then((summary) => {
-        if (summary.claimed > 0) process.stdout.write(`${JSON.stringify({ event: 'pending_reference_batch', workerId: this.workerId, ...summary })}\n`);
+        if (summary.claimed > 0) logEvent('pending-reference-worker', 'pending_reference_batch', { workerId: this.workerId, ...summary });
       }).catch((error: unknown) => {
-        process.stderr.write(`${JSON.stringify({ event: 'pending_reference_worker_error', workerId: this.workerId,
-          message: error instanceof Error ? error.message : 'Unknown worker error' })}\n`);
+        metrics.increment('pending_reference_worker_errors_total');
+        logEvent('pending-reference-worker', 'pending_reference_worker_error', { workerId: this.workerId,
+          errorCode: error && typeof error === 'object' && 'name' in error ? String(error.name) : 'UNKNOWN' }, 'error');
       }).finally(() => { this.active = false; });
     }, this.pollIntervalMs);
   }

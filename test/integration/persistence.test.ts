@@ -21,6 +21,17 @@ import { PendingReferenceWorker } from '../../src/wagering/pending-reference.wor
 import { ReferenceRetryPolicy } from '../../src/wagering/reference-retry-policy';
 import { WagerSqsConsumer, createWagerSqsClient } from '../../src/messaging/wager-sqs-consumer';
 import { OutboxPublisher } from '../../src/messaging/outbox-publisher';
+import { HealthController } from '../../src/health/health.controller';
+import { MetricsController } from '../../src/health/metrics.controller';
+import { HealthService } from '../../src/health/health.service';
+import { WageringController } from '../../src/wagering/wagering.controller';
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
+import { MikroORM } from '@mikro-orm/postgresql';
+import { createOrmOptions } from '../../src/persistence/orm';
+import { HttpObservabilityMiddleware } from '../../src/observability/http-observability.middleware';
+import { metrics } from '../../src/observability/metrics';
+import { SafeHttpExceptionFilter } from '../../src/observability/http-exception.filter';
 
 const testDatabaseName = process.env.TEST_DATABASE_NAME ?? 'wagering_phase2_test';
 let orm: Awaited<ReturnType<typeof createOrm>>;
@@ -29,6 +40,10 @@ let wagers: ProcessWagerService;
 
 function id(): string { return randomUUID(); }
 function hash(): string { return 'a'.repeat(64); }
+async function metricValue(name: string, labels = ''): Promise<number> {
+  const line = (await metrics.render()).split('\n').find((value) => value.startsWith(`${name}${labels ? `{${labels}}` : ''} `));
+  return line ? Number(line.slice(line.lastIndexOf(' ') + 1)) : 0;
+}
 
 async function insertWager(props: {
   walletId: string; playerId: string; kind: string; externalId: string; key?: string;
@@ -645,7 +660,7 @@ describe('PostgreSQL and LocalStack SQS consumer phase 5', () => {
 
   function consumer(waitTimeSeconds = 1, maxMessages = 10): WagerSqsConsumer {
     return new WagerSqsConsumer(wagers, sqs, { queueUrl, consumerName, visibilityTimeoutSeconds: 2,
-      waitTimeSeconds, maxMessages, retryBaseSeconds: 1, retryMaximumSeconds: 2 });
+      waitTimeSeconds, maxMessages, retryBaseSeconds: 1, retryMaximumSeconds: 2, maxReceiveCount: 3 });
   }
 
   async function rowFor(providerId: string, externalTransactionId: string): Promise<WagerTransactionRecord | undefined> {
@@ -852,6 +867,7 @@ describe('PostgreSQL and LocalStack SQS consumer phase 5', () => {
     await orm.em.getConnection().execute(`update wager_transactions set next_attempt_at = now() - interval '1 second' where provider_id = ? and external_transaction_id = ?`,
       [refund.providerId, refund.externalTransactionId]);
     expect((await new PendingReferenceWorker(wagers).runOnce()).processed).toBe(1);
+    expect(await metricValue('pending_reference_outcomes_total', 'outcome="processed"')).toBeGreaterThan(0);
     expect((await rowFor(refund.providerId, refund.externalTransactionId))?.status).toBe(WagerTransactionStatus.Processed);
     expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
   });
@@ -873,6 +889,9 @@ describe('PostgreSQL and LocalStack SQS consumer phase 5', () => {
     try {
       await send(message, wallet.id);
       expect(await consumer().runOnce()).toEqual({ received: 1, acknowledged: 0, inboxDuplicates: 0, deferred: 1 });
+      expect(await metricValue('wager_transaction_retries_total')).toBeGreaterThan(0);
+      expect(await metricValue('wager_lock_conflicts_total', 'outcome="serialization"')).toBeGreaterThan(0);
+      expect(await metricValue('sqs_message_retries_total', 'outcome="transient"')).toBeGreaterThan(0);
       const [rolledBack] = await orm.em.getConnection().execute<Array<{ inbox: string; wagers: string; ledger: string }>>(
         `select (select count(*) from inbox_messages where consumer_name = ? and message_id = ?)::text as inbox,
           (select count(*) from wager_transactions where provider_id = ? and external_transaction_id = ?)::text as wagers,
@@ -980,10 +999,10 @@ describe('PostgreSQL and LocalStack SQS consumer phase 5', () => {
         readOutput(secondProcess.stdout, (chunk) => { secondOutput += chunk; }),
         readOutput(secondProcess.stderr, (chunk) => { secondOutput += chunk; }),
       ];
-      for (let attempt = 0; attempt < 100 && !secondOutput.includes('wager_sqs_inbox_duplicate'); attempt += 1) {
+      for (let attempt = 0; attempt < 100 && !secondOutput.includes('"event":"wager_duplicate_detected"'); attempt += 1) {
         await Bun.sleep(100);
       }
-      expect(secondOutput).toContain('wager_sqs_inbox_duplicate');
+      expect(secondOutput).toContain('"event":"wager_duplicate_detected"');
     } finally {
       if (firstProcess.exitCode === null) firstProcess.kill('SIGKILL');
       if (secondProcess && secondProcess.exitCode === null) secondProcess.kill('SIGTERM');
@@ -1016,6 +1035,9 @@ describe('PostgreSQL and LocalStack SQS consumer phase 5', () => {
     }
     expect(deliveries).toBeGreaterThanOrEqual(3);
     expect(deadLetterReceived).toBe(true);
+    expect(await metrics.render()).toMatch(/sqs_messages_forwarded_to_dlq_total [1-9]\d*/);
+    await new HealthService(orm, sqs, queueUrl, dlqUrl).sampleOperationalGauges();
+    expect(await metrics.render()).toMatch(/sqs_dlq_messages [1-9]\d*/);
   }, 15_000);
 });
 
@@ -1146,6 +1168,8 @@ describe('PostgreSQL and LocalStack transactional outbox publisher phase 6', () 
       credentials: { accessKeyId: 'test', secretAccessKey: 'test' }, maxAttempts: 1 });
     try {
       expect(await publisher({}, unavailableSqs).runOnce()).toEqual({ claimed: 1, published: 0, deferred: 1, staleClaims: 0 });
+      expect(await metricValue('outbox_publications_total', 'outcome="failure"')).toBeGreaterThan(0);
+      expect(await metricValue('outbox_publish_retries_total')).toBeGreaterThan(0);
     } finally {
       unavailableSqs.destroy();
     }
@@ -1157,10 +1181,46 @@ describe('PostgreSQL and LocalStack transactional outbox publisher phase 6', () 
     expect(await publisher().runOnce()).toEqual({ claimed: 0, published: 0, deferred: 0, staleClaims: 0 });
     await Bun.sleep(60);
     expect(await publisher().runOnce()).toEqual({ claimed: 1, published: 1, deferred: 0, staleClaims: 0 });
+    expect(await metricValue('outbox_publications_total', 'outcome="success"')).toBeGreaterThan(0);
     expect(JSON.parse((await receive(1)).Messages?.[0]?.Body ?? '{}').eventId).toBe(envelope.eventId);
     const [row] = await orm.em.getConnection().execute<Array<{ attempts: number; published: boolean; lastError: string | null }>>(
       `select attempts, published_at is not null as published, last_error as "lastError" from outbox_messages where id = ?`, [envelope.eventId]);
     expect(row).toEqual({ attempts: 1, published: true, lastError: null });
+  });
+
+  test('a failed earlier event blocks later events for the same wallet across concurrent publishers', async () => {
+    const wallet = await wallets.open({ playerId: id(), initialBalance: { amount: '0.00', currency: 'BRL' } });
+    const first = event(wallet.id);
+    const second = event(wallet.id);
+    await insertEvent(first);
+    await insertEvent(second);
+    const unavailableSqs = new SQSClient({ endpoint: 'http://127.0.0.1:4567', region: 'us-east-1',
+      credentials: { accessKeyId: 'test', secretAccessKey: 'test' }, maxAttempts: 1 });
+    try { expect((await publisher({}, unavailableSqs).runOnce()).deferred).toBe(1); }
+    finally { unavailableSqs.destroy(); }
+    expect((await Promise.all([publisher().runOnce(), publisher().runOnce()])).map((result) => result.claimed))
+      .toEqual([0, 0]);
+    expect((await receive(2)).Messages ?? []).toEqual([]);
+    await Bun.sleep(60);
+    process.env.WAGER_OUTBOX_TEST_ENABLE_FAULTS = 'true';
+    process.env.WAGER_OUTBOX_TEST_PAUSE_AFTER_CLAIM_MS = '100';
+    let raced: Awaited<ReturnType<OutboxPublisher['runOnce']>>[];
+    try { raced = await Promise.all([publisher({ batchSize: 1 }).runOnce(), publisher({ batchSize: 1 }).runOnce()]); }
+    finally {
+      delete process.env.WAGER_OUTBOX_TEST_ENABLE_FAULTS;
+      delete process.env.WAGER_OUTBOX_TEST_PAUSE_AFTER_CLAIM_MS;
+    }
+    expect(raced.reduce((sum, result) => sum + result.published, 0)).toBe(1);
+    const firstMessage = (await receive(1)).Messages?.[0];
+    expect(JSON.parse(firstMessage?.Body ?? '{}').eventId).toBe(first.eventId);
+    await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: firstMessage!.ReceiptHandle! }));
+    expect((await Promise.all([publisher().runOnce(), publisher().runOnce()])).reduce((sum, result) => sum + result.published, 0))
+      .toBe(1);
+    const secondMessage = (await receive(1)).Messages?.[0];
+    expect(JSON.parse(secondMessage?.Body ?? '{}').eventId).toBe(second.eventId);
+    const [ordered] = await orm.em.getConnection().execute<Array<{ events: string[] }>>(
+      `select array_agg(id::text order by publication_order) as events from outbox_messages where aggregate_id = ?`, [wallet.id]);
+    expect(ordered?.events).toEqual([first.eventId, second.eventId]);
   });
 
   test('two publishers claim different aggregates and a stale claim cannot overwrite the current owner', async () => {
@@ -1357,7 +1417,7 @@ describe('PostgreSQL and LocalStack transactional outbox publisher phase 6', () 
       await gracefulPublisher.exited;
       const gracefulOutput = await new Response(gracefulPublisher.stdout).text()
         + await new Response(gracefulPublisher.stderr).text();
-      expect(gracefulOutput).toContain('outbox_shutdown_complete');
+      expect(gracefulOutput).toContain('"event":"process_shutdown_complete"');
       const [state] = await orm.em.getConnection().execute<Array<{ published: boolean }>>(
         `select published_at is not null as published from outbox_messages where id = ?`, [gracefulEvent.eventId]);
       expect(state?.published).toBe(true);
@@ -1369,5 +1429,102 @@ describe('PostgreSQL and LocalStack transactional outbox publisher phase 6', () 
     expect(messages.map((message) => (JSON.parse(message.Body!) as { eventId: string }).eventId)
       .filter((eventId) => [beforeSendEvent.eventId, afterSendEvent.eventId, gracefulEvent.eventId].includes(eventId)).sort())
       .toEqual([beforeSendEvent.eventId, afterSendEvent.eventId, gracefulEvent.eventId].sort());
+  }, 30_000);
+});
+
+async function createObservabilityApp(health: HealthService) {
+  @Module({
+    controllers: [HealthController, MetricsController, WageringController],
+    providers: [{ provide: HealthService, useValue: health }, { provide: ProcessWagerService, useValue: wagers }],
+  })
+  class ObservabilityTestModule implements NestModule {
+    configure(consumer: MiddlewareConsumer): void { consumer.apply(HttpObservabilityMiddleware).forRoutes('*'); }
+  }
+  const app = await NestFactory.create(ObservabilityTestModule, { logger: false });
+  app.useGlobalFilters(new SafeHttpExceptionFilter());
+  await app.listen(0, '127.0.0.1');
+  return app;
+}
+
+describe('observability HTTP integration with PostgreSQL and LocalStack', () => {
+  test('serves liveness, readiness and process metrics and records a real financial request', async () => {
+    const sqs = createWagerSqsClient();
+    const health = new HealthService(orm, sqs, process.env.SQS_COMMAND_QUEUE_URL!, process.env.SQS_DLQ_QUEUE_URL ?? '');
+    const app = await createObservabilityApp(health);
+    try {
+      const baseUrl = await app.getUrl();
+      const live = await fetch(`${baseUrl}/health/live`);
+      expect(live.status).toBe(200);
+      const ready = await fetch(`${baseUrl}/health/ready`);
+      expect(ready.status).toBe(200);
+      const playerId = id();
+      const wallet = await wallets.open({ playerId, initialBalance: { amount: '25.00', currency: 'BRL' } });
+      const idempotencyKey = `obs-${id()}`;
+      const externalTransactionId = id();
+      const requestBody = { providerId: 'observability-provider', externalTransactionId, playerId,
+        walletId: wallet.id, roundId: 'observability-round', gameId: 'observability-game', kind: 'BET',
+        money: { amount: '1.00', currency: 'BRL' } };
+      const submit = (body: typeof requestBody) => fetch(`${baseUrl}/wagering/transactions`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': idempotencyKey,
+          'x-correlation-id': 'observability-correlation-1' },
+        body: JSON.stringify(body),
+      });
+      const response = await submit(requestBody);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('x-correlation-id')).toBe('observability-correlation-1');
+      const original = await response.json() as { transactionId: string; balance: { amount: string } };
+      const replayResponse = await submit(requestBody);
+      expect(replayResponse.status).toBe(200);
+      const replay = await replayResponse.json() as { transactionId: string; balance: { amount: string }; idempotentReplay: boolean };
+      expect(replay).toMatchObject({ transactionId: original.transactionId, balance: original.balance, idempotentReplay: true });
+      expect((await submit({ ...requestBody, money: { amount: '2.00', currency: 'BRL' } })).status).toBe(409);
+      const [eventCorrelation] = await orm.em.getConnection().execute<Array<{ correlationId: string }>>(
+        `select payload->>'correlationId' as "correlationId" from outbox_messages
+         where payload->'data'->>'transactionId' = ? limit 1`, [original.transactionId]);
+      expect(eventCorrelation?.correlationId).toBe('observability-correlation-1');
+      const exposition = await fetch(`${baseUrl}/metrics`).then((result) => result.text());
+      expect(exposition).toContain('wager_transactions_total{kind="BET",status="PROCESSED"}');
+      expect(exposition).toContain('wager_duplicates_total{operation="idempotency"}');
+      expect(exposition).toContain('wager_idempotency_conflicts_total');
+      expect(exposition).toContain('wager_processing_duration_seconds_count{kind="BET"}');
+      expect(exposition).toContain('outbox_pending_events');
+      expect(exposition).toContain('sqs_dlq_messages');
+    } finally { await app.close(); sqs.destroy(); }
+  }, 30_000);
+
+  test('liveness remains healthy while readiness fails for unavailable dependencies and recovers', async () => {
+    const endpoint = process.env.SQS_ENDPOINT ?? 'http://127.0.0.1:4566';
+    const sqs = new SQSClient({ region: 'us-east-1', endpoint, maxAttempts: 1,
+      credentials: { accessKeyId: 'test', secretAccessKey: 'test' } });
+    const invalidQueue = `${endpoint}/000000000000/queue-that-does-not-exist.fifo`;
+    const sqsDownApp = await createObservabilityApp(new HealthService(orm, sqs, invalidQueue, ''));
+    try {
+      const baseUrl = await sqsDownApp.getUrl();
+      expect((await fetch(`${baseUrl}/health/live`)).status).toBe(200);
+      expect((await fetch(`${baseUrl}/health/ready`)).status).toBe(503);
+    } finally { await sqsDownApp.close(); sqs.destroy(); }
+
+    const goodSqs = createWagerSqsClient();
+    const recoveredApp = await createObservabilityApp(new HealthService(orm, goodSqs,
+      process.env.SQS_COMMAND_QUEUE_URL!, process.env.SQS_DLQ_QUEUE_URL ?? ''));
+    try { expect((await fetch(`${await recoveredApp.getUrl()}/health/ready`)).status).toBe(200); }
+    finally { await recoveredApp.close(); goodSqs.destroy(); }
+
+    const databaseUrl = process.env.DATABASE_URL ?? 'postgresql://wagering_app:local_only_change_me@127.0.0.1:5432/wagering_phase2_test';
+    const unavailableDatabaseUrl = databaseUrl.replace(/:\d+\//, ':65431/');
+    const unavailableOrm = await MikroORM.init({ ...createOrmOptions(), clientUrl: unavailableDatabaseUrl }) as unknown as MikroORM;
+    const databaseSqs = createWagerSqsClient();
+    const pgDownApp = await createObservabilityApp(new HealthService(unavailableOrm, databaseSqs,
+      process.env.SQS_COMMAND_QUEUE_URL!, ''));
+    try {
+      const baseUrl = await pgDownApp.getUrl();
+      expect((await fetch(`${baseUrl}/health/live`)).status).toBe(200);
+      expect((await fetch(`${baseUrl}/health/ready`)).status).toBe(503);
+    } finally { await pgDownApp.close(); databaseSqs.destroy(); await unavailableOrm.close(true); }
+    const finalSqs = createWagerSqsClient();
+    const finalApp = await createObservabilityApp(new HealthService(orm, finalSqs,
+      process.env.SQS_COMMAND_QUEUE_URL!, process.env.SQS_DLQ_QUEUE_URL ?? ''));
+    try { expect((await fetch(`${await finalApp.getUrl()}/health/ready`)).status).toBe(200); }
+    finally { await finalApp.close(); finalSqs.destroy(); }
   }, 30_000);
 });

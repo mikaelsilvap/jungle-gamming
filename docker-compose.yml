@@ -40,6 +40,12 @@ services:
     environment:
       NODE_ENV: development
       PORT: 3000
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      SQS_ENDPOINT: http://localstack:4566
+      SQS_COMMAND_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_DLQ_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
       DATABASE_URL: postgresql://${POSTGRES_USER:-wagering_app}:${POSTGRES_PASSWORD:-local_only_change_me}@postgres:5432/${POSTGRES_DB:-wagering}
     ports:
       - "127.0.0.1:3000:3000"
@@ -60,10 +66,17 @@ services:
     command: ["bun", "run", "dist/src/wagering/pending-reference-worker.main.js"]
     environment:
       NODE_ENV: development
+      METRICS_PORT: 9102
       DATABASE_URL: postgresql://${POSTGRES_USER:-wagering_app}:${POSTGRES_PASSWORD:-local_only_change_me}@postgres:5432/${POSTGRES_DB:-wagering}
     depends_on:
       postgres:
         condition: service_healthy
+    expose: ["9102"]
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:9102/health/live').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   sqs-consumer:
     build: .
@@ -76,9 +89,18 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
       SQS_ENDPOINT: http://localstack:4566
       SQS_COMMAND_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_DLQ_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
+      METRICS_PORT: 9101
       SQS_VISIBILITY_TIMEOUT_SECONDS: 60
+      SQS_MAX_RECEIVE_COUNT: 5
       SQS_CONSUMER_NAME: distributed-wagering-processor-v1
     stop_grace_period: 90s
+    expose: ["9101"]
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:9101/health/live').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     depends_on:
       postgres:
         condition: service_healthy
@@ -102,7 +124,15 @@ services:
       OUTBOX_RETRY_BASE_MS: ${OUTBOX_RETRY_BASE_MS:-1000}
       OUTBOX_RETRY_MAXIMUM_MS: ${OUTBOX_RETRY_MAXIMUM_MS:-60000}
       OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
+      METRICS_PORT: 9103
+      SQS_DLQ_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
     stop_grace_period: 90s
+    expose: ["9103"]
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:9103/health/live').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     depends_on:
       postgres:
         condition: service_healthy

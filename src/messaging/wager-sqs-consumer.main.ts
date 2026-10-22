@@ -1,6 +1,10 @@
 import { createOrm } from '../persistence/orm';
 import { ProcessWagerService } from '../wagering/process-wager.service';
 import { createWagerSqsClient, WagerSqsConsumer } from './wager-sqs-consumer';
+import { HealthService } from '../health/health.service';
+import { startDiagnosticServer } from '../observability/diagnostics-server';
+import { metrics } from '../observability/metrics';
+import { logEvent } from '../observability/logger';
 
 async function main(): Promise<void> {
   const queueUrl = process.env.SQS_COMMAND_QUEUE_URL;
@@ -11,24 +15,30 @@ async function main(): Promise<void> {
     queueUrl,
     consumerName: process.env.SQS_CONSUMER_NAME ?? 'distributed-wagering-processor-v1',
     visibilityTimeoutSeconds: Number.parseInt(process.env.SQS_VISIBILITY_TIMEOUT_SECONDS ?? '60', 10),
+    maxReceiveCount: Number.parseInt(process.env.SQS_MAX_RECEIVE_COUNT ?? '5', 10),
     waitTimeSeconds: 20,
     maxMessages: 10,
   });
+  const health = new HealthService(orm, sqs, queueUrl, process.env.SQS_DLQ_QUEUE_URL ?? '');
+  const diagnostics = startDiagnosticServer({ service: 'sqs-consumer', port: Number(process.env.METRICS_PORT ?? 9101),
+    registry: metrics, ready: async () => (await health.ready()).ready,
+    sample: () => health.sampleOperationalGauges() });
   consumer.start();
 
   let shutdown: Promise<void> | undefined;
   const stop = () => {
     if (shutdown) return;
     shutdown = (async () => {
-      process.stdout.write(`${JSON.stringify({ event: 'wager_sqs_shutdown_started', consumerName: process.env.SQS_CONSUMER_NAME ?? 'distributed-wagering-processor-v1' })}\n`);
+      logEvent('sqs-consumer', 'process_shutdown_started', { consumerName: process.env.SQS_CONSUMER_NAME ?? 'distributed-wagering-processor-v1' });
       await consumer.stop();
+      diagnostics.stop();
       sqs.destroy();
       await orm.close(true);
-      process.stdout.write(`${JSON.stringify({ event: 'wager_sqs_shutdown_complete' })}\n`);
+      logEvent('sqs-consumer', 'process_shutdown_complete');
     })();
     void shutdown.catch((error: unknown) => {
-      process.stderr.write(`${JSON.stringify({ event: 'wager_sqs_shutdown_failed',
-        message: error instanceof Error ? error.message : 'Unknown shutdown error' })}\n`);
+      logEvent('sqs-consumer', 'process_shutdown_failed',
+        { errorCode: error && typeof error === 'object' && 'name' in error ? String(error.name) : 'UNKNOWN' }, 'error');
       process.exitCode = 1;
     });
   };
@@ -37,7 +47,7 @@ async function main(): Promise<void> {
 }
 
 void main().catch((error: unknown) => {
-  process.stderr.write(`${JSON.stringify({ event: 'wager_sqs_startup_failed',
-    message: error instanceof Error ? error.message : 'Unknown startup error' })}\n`);
+  logEvent('sqs-consumer', 'process_startup_failed',
+    { errorCode: error && typeof error === 'object' && 'name' in error ? String(error.name) : 'UNKNOWN' }, 'error');
   process.exitCode = 1;
 });

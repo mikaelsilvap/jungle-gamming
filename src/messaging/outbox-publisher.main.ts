@@ -1,5 +1,9 @@
 import { createOrm } from '../persistence/orm';
 import { OutboxPublisher, createOutboxSqsClient } from './outbox-publisher';
+import { HealthService } from '../health/health.service';
+import { startDiagnosticServer } from '../observability/diagnostics-server';
+import { metrics } from '../observability/metrics';
+import { logEvent } from '../observability/logger';
 
 async function main(): Promise<void> {
   const queueUrl = process.env.SQS_EVENTS_QUEUE_URL;
@@ -16,21 +20,26 @@ async function main(): Promise<void> {
     retryMaximumMs: Number.parseInt(process.env.OUTBOX_RETRY_MAXIMUM_MS ?? '60000', 10),
     pollIntervalMs: Number.parseInt(process.env.OUTBOX_POLL_INTERVAL_MS ?? '1000', 10),
   });
+  const health = new HealthService(orm, sqs, process.env.SQS_EVENTS_QUEUE_URL ?? '', process.env.SQS_DLQ_QUEUE_URL ?? '');
+  const diagnostics = startDiagnosticServer({ service: 'outbox-publisher', port: Number(process.env.METRICS_PORT ?? 9103),
+    registry: metrics, ready: async () => (await health.ready()).ready,
+    sample: () => health.sampleOperationalGauges() });
   publisher.start();
 
   let shutdown: Promise<void> | undefined;
   const stop = () => {
     if (shutdown) return;
     shutdown = (async () => {
-      process.stdout.write(`${JSON.stringify({ event: 'outbox_shutdown_started', publisherId })}\n`);
+      logEvent('outbox-publisher', 'process_shutdown_started', { publisherId });
       await publisher.stop();
+      diagnostics.stop();
       sqs.destroy();
       await orm.close(true);
-      process.stdout.write(`${JSON.stringify({ event: 'outbox_shutdown_complete' })}\n`);
+      logEvent('outbox-publisher', 'process_shutdown_complete', { publisherId });
     })();
     void shutdown.catch((error: unknown) => {
-      process.stderr.write(`${JSON.stringify({ event: 'outbox_shutdown_failed',
-        error: error instanceof Error ? error.message : 'Unknown shutdown error' })}\n`);
+      logEvent('outbox-publisher', 'process_shutdown_failed',
+        { errorCode: error && typeof error === 'object' && 'name' in error ? String(error.name) : 'UNKNOWN' }, 'error');
       process.exitCode = 1;
     });
   };
@@ -39,7 +48,7 @@ async function main(): Promise<void> {
 }
 
 void main().catch((error: unknown) => {
-  process.stderr.write(`${JSON.stringify({ event: 'outbox_startup_failed',
-    error: error instanceof Error ? error.message : 'Unknown startup error' })}\n`);
+  logEvent('outbox-publisher', 'process_startup_failed',
+    { errorCode: error && typeof error === 'object' && 'name' in error ? String(error.name) : 'UNKNOWN' }, 'error');
   process.exitCode = 1;
 });

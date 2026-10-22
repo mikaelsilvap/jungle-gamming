@@ -7,6 +7,7 @@ import {
   WalletReconciliation,
   WalletResponse,
 } from './application/wallet-persistence.port';
+import { currentLogContext } from '../observability/logger';
 
 export interface OpenWalletInput {
   playerId: string;
@@ -46,7 +47,8 @@ export class WalletOpeningService {
       openingTransaction.markProcessed(undefined, now);
       const openingLedger = wallet.createOpeningLedgerEntry(randomUUID(), transactionId, now);
       if (!openingLedger) throw new Error('Positive wallet opening did not produce a ledger entry.');
-      const context = () => ({ eventId: randomUUID(), correlationId: transactionId, causationId: transactionId, occurredAt: now });
+      const context = () => ({ eventId: randomUUID(), correlationId: currentLogContext().correlationId ?? transactionId,
+        causationId: transactionId, occurredAt: now });
       const outbox = [
         OutboxMessage.enqueue(WagerTransactionProcessed.from(openingTransaction, context())),
         OutboxMessage.enqueue(WalletBalanceChanged.from(wallet, openingLedger, context())),

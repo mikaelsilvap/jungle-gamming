@@ -1,6 +1,8 @@
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { OutboxMessage } from '../domain/outbox-message';
+import { logEvent, withLogContext } from '../observability/logger';
+import { metrics } from '../observability/metrics';
 
 interface OutboxRow {
   id: string;
@@ -37,8 +39,9 @@ function date(value: Date | string | null | undefined): Date | undefined {
 }
 
 function errorText(error: unknown): string {
-  const value = error instanceof Error ? error.message : 'Unknown SQS publication error';
-  return value.slice(0, 2_000);
+  const name = error instanceof Error ? error.name : 'UnknownError';
+  const code = error && typeof error === 'object' && 'name' in error ? String(error.name) : 'unknown';
+  return `${name}:${code}`.slice(0, 200);
 }
 
 /** PostgreSQL-backed at-least-once publisher for the transactional outbox. */
@@ -81,8 +84,14 @@ export class OutboxPublisher {
     if (Number.isSafeInteger(pauseAfterClaim) && pauseAfterClaim > 0) {
       await new Promise((resolve) => setTimeout(resolve, Math.min(pauseAfterClaim, 60_000)));
     }
-    const publicationResults = await Promise.allSettled(claimed.map(async (row) => {
+    const publicationResults = await Promise.allSettled(claimed.map(async (row) => withLogContext({
+      ...(typeof row.payload.correlationId === 'string' ? { correlationId: row.payload.correlationId } : {}),
+      ...(typeof (row.payload.data as Record<string, unknown> | undefined)?.transactionId === 'string'
+        ? { transactionId: (row.payload.data as Record<string, string>).transactionId } : {}),
+      walletId: row.aggregateId, eventId: row.id,
+    }, async () => {
       try {
+        const publishStartedAt = performance.now();
         await this.sqs.send(new SendMessageCommand({
           QueueUrl: this.options.queueUrl,
           MessageBody: JSON.stringify(row.payload),
@@ -98,24 +107,30 @@ export class OutboxPublisher {
         const updated = await this.markPublished(row, sentAt);
         if (updated) {
           stats.published += 1;
-          process.stdout.write(`${JSON.stringify({ event: 'outbox_published', publisherId: this.options.publisherId,
-            eventId: row.id, eventType: row.eventType, aggregateId: row.aggregateId, attempts: row.attempts })}\n`);
+          metrics.increment('outbox_publications_total', { outcome: 'success' });
+          metrics.observe('outbox_publish_duration_seconds', Math.max(0, performance.now() - publishStartedAt) / 1_000, { outcome: 'success' });
+          metrics.observe('outbox_event_age_seconds', Math.max(0, sentAt.getTime() - (date(row.occurredAt)?.getTime() ?? sentAt.getTime())) / 1_000);
+          logEvent('outbox-publisher', 'outbox_event_published', { publisherId: this.options.publisherId,
+            eventId: row.id, eventType: row.eventType, walletId: row.aggregateId, attempts: row.attempts });
         } else {
           stats.staleClaims += 1;
-          process.stderr.write(`${JSON.stringify({ event: 'outbox_stale_claim_result', publisherId: this.options.publisherId,
-            eventId: row.id, aggregateId: row.aggregateId })}\n`);
+          logEvent('outbox-publisher', 'outbox_stale_claim_result', { publisherId: this.options.publisherId,
+            eventId: row.id, walletId: row.aggregateId }, 'warn');
         }
       } catch (error) {
         const retryAt = new Date();
         const updated = await this.scheduleRetry(row, error, retryAt);
         if (updated) stats.deferred += 1;
         else stats.staleClaims += 1;
-        process.stderr.write(`${JSON.stringify({ event: updated ? 'outbox_retry_scheduled' : 'outbox_stale_claim_failure',
-          publisherId: this.options.publisherId, eventId: row.id, aggregateId: row.aggregateId, attempts: row.attempts + 1,
-          retryAt: updated ? new Date(retryAt.getTime() + this.retryDelayMs(row.attempts + 1)).toISOString() : undefined,
-          error: errorText(error) })}\n`);
+        if (updated) {
+          metrics.increment('outbox_publications_total', { outcome: 'failure' });
+          metrics.increment('outbox_publish_retries_total');
+        }
+        logEvent('outbox-publisher', updated ? 'outbox_publish_failed' : 'outbox_stale_claim_failure',
+          { publisherId: this.options.publisherId, eventId: row.id, walletId: row.aggregateId, attempts: row.attempts + 1,
+            errorCode: errorText(error) }, 'error');
       }
-    }));
+    })));
     const failedPublication = publicationResults.find((result) => result.status === 'rejected');
     if (failedPublication?.status === 'rejected') throw failedPublication.reason;
     return stats;
@@ -185,8 +200,8 @@ export class OutboxPublisher {
         const stats = await this.runOnce();
         if (!stats.claimed && !this.stopping) await new Promise((resolve) => setTimeout(resolve, this.options.pollIntervalMs ?? 1_000));
       } catch (error) {
-        process.stderr.write(`${JSON.stringify({ event: 'outbox_poll_error', publisherId: this.options.publisherId,
-          error: errorText(error) })}\n`);
+        logEvent('outbox-publisher', 'outbox_poll_error', { publisherId: this.options.publisherId,
+          errorCode: errorText(error) }, 'error');
         if (!this.stopping) await new Promise((resolve) => setTimeout(resolve, this.options.pollIntervalMs ?? 1_000));
       }
     }
