@@ -13,6 +13,7 @@ import {
 } from '../../src/persistence/rehydration';
 import { WalletOpeningService } from '../../src/wallets/wallet-opening.service';
 import { ProcessWagerInput, ProcessWagerService } from '../../src/wagering/process-wager.service';
+import { PendingReferenceWorker } from '../../src/wagering/pending-reference.worker';
 
 const testDatabaseName = process.env.TEST_DATABASE_NAME ?? 'wagering_phase2_test';
 let orm: Awaited<ReturnType<typeof createOrm>>;
@@ -420,5 +421,154 @@ describe('PostgreSQL wagering phase 3', () => {
        (select count(*) from outbox_messages where aggregate_id = ?)::text as events`,
       [wallet.id, wallet.id, wallet.id, wallet.id, wallet.id]);
     expect(counts).toEqual({ balance: '20.00', wagers: '0', entries: '1', events: '2' });
+  });
+});
+
+describe('PostgreSQL pending-reference worker phase 4', () => {
+  function betInput(walletId: string, playerId: string, overrides: Partial<ProcessWagerInput> = {}): ProcessWagerInput {
+    return {
+      providerId: `provider-${playerId}`, externalTransactionId: id(), playerId, walletId,
+      roundId: 'phase4-round', gameId: 'phase4-game', kind: WagerTransactionKind.Bet,
+      money: { amount: '10.00', currency: 'BRL' }, ...overrides,
+    };
+  }
+
+  async function pendingOperation(kind: WagerTransactionKind, playerId: string, walletId: string, referenceId: string, providerId: string, amount = '10.00') {
+    const input: ProcessWagerInput = {
+      providerId, externalTransactionId: id(), playerId, walletId, roundId: 'phase4-round', gameId: 'phase4-game',
+      kind, money: { amount, currency: 'BRL' }, referenceExternalTransactionId: referenceId,
+    };
+    const key = `pending:${id()}`;
+    return { input, key, result: await wagers.process(input, key) };
+  }
+
+  async function makeDue(transactionId: string): Promise<void> {
+    await orm.em.getConnection().execute(
+      `update wager_transactions set next_attempt_at = now() - interval '1 second' where id = ?`, [transactionId]);
+  }
+
+  test('resolves REFUND that arrived before its BET and preserves one pending event', async () => {
+    const playerId = id();
+    const providerId = `provider-${playerId}`;
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const pending = await pendingOperation(WagerTransactionKind.Refund, playerId, wallet.id, 'late-bet', providerId);
+    expect(pending.result.status).toBe(WagerTransactionStatus.PendingReference);
+    const bet = betInput(wallet.id, playerId, {
+      providerId, externalTransactionId: 'late-bet', roundId: pending.input.roundId,
+      money: { amount: '10.00', currency: 'BRL' },
+    });
+    expect((await wagers.process(bet, `late-bet-key:${id()}`)).status).toBe(WagerTransactionStatus.Processed);
+    await makeDue(pending.result.transactionId);
+    const worker = new PendingReferenceWorker(wagers, () => new Date());
+    const summary = await worker.runOnce();
+    expect(summary.processed).toBe(1);
+    const replay = await wagers.process(pending.input, pending.key);
+    expect(replay.status).toBe(WagerTransactionStatus.Processed);
+    expect(replay.idempotentReplay).toBe(true);
+    expect(replay.balance.amount).toBe('100.00');
+    const [counts] = await orm.em.getConnection().execute<Array<{ entries: string; pendingEvents: string; processedEvents: string; balanceEvents: string }>>(
+      `select (select count(*) from wallet_ledger_entries where transaction_id = ?)::text as entries,
+       (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionPendingReference')::text as "pendingEvents",
+       (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionProcessed')::text as "processedEvents",
+       (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WalletBalanceChanged')::text as "balanceEvents"`,
+      [pending.result.transactionId, pending.result.transactionId, pending.result.transactionId, pending.result.transactionId]);
+    expect(counts).toEqual({ entries: '1', pendingEvents: '1', processedEvents: '1', balanceEvents: '1' });
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('resolves ROLLBACK after a reference is initially unprocessed, without retry event duplication', async () => {
+    const playerId = id();
+    const providerId = 'provider-test';
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const referenceId = await insertWager({ walletId: wallet.id, playerId, kind: 'BET', externalId: `not-yet-${id()}`, status: 'PENDING' });
+    await orm.em.getConnection().execute(`update wager_transactions set round_id = 'phase4-round', game_id = 'phase4-game' where id = ?`, [referenceId]);
+    const [reference] = await orm.em.getConnection().execute<Array<{ external_transaction_id: string }>>(
+      `select external_transaction_id from wager_transactions where id = ?`, [referenceId]);
+    const pending = await pendingOperation(WagerTransactionKind.Rollback, playerId, wallet.id, reference!.external_transaction_id, providerId, '1.00');
+    expect(pending.result.status).toBe(WagerTransactionStatus.PendingReference);
+    await makeDue(pending.result.transactionId);
+    const firstWorker = new PendingReferenceWorker(wagers, () => new Date());
+    expect((await firstWorker.runOnce()).rescheduled).toBe(1);
+    const [afterRetry] = await orm.em.getConnection().execute<Array<{ attempts: number; pendingEvents: string; entries: string }>>(
+      `select pending_attempts as attempts,
+        (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionPendingReference')::text as "pendingEvents",
+        (select count(*) from wallet_ledger_entries where transaction_id = ?)::text as entries
+       from wager_transactions where id = ?`,
+      [pending.result.transactionId, pending.result.transactionId, pending.result.transactionId]);
+    expect(afterRetry).toEqual({ attempts: 1, pendingEvents: '1', entries: '0' });
+
+    const [lockedWallet] = await orm.em.getConnection().execute<Array<{ balance: string; version: number }>>(
+      `select balance_amount::text as balance, version from wallets where id = ?`, [wallet.id]);
+    const after = Money.from({ amount: lockedWallet!.balance, currency: 'BRL' }).subtract(Money.from({ amount: '1.00', currency: 'BRL' }));
+    const processedAt = new Date();
+    await orm.em.getConnection().execute(
+      `update wallets set balance_amount = ?, version = version + 1, updated_at = ? where id = ?`,
+      [after.toJSON().amount, processedAt, wallet.id]);
+    await orm.em.getConnection().execute(
+      `update wager_transactions set status = 'PROCESSED', processed_at = ?, result_balance_amount = ?, result_currency = 'BRL' where id = ?`,
+      [processedAt, after.toJSON().amount, referenceId]);
+    await orm.em.getConnection().execute(
+      `insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+       values (?, ?, ?, 'DEBIT', '1.00', 'BRL', ?, ?, ?)`,
+      [id(), wallet.id, referenceId, lockedWallet!.balance, after.toJSON().amount, processedAt]);
+    await orm.em.getConnection().execute(
+      `update wager_transactions set next_attempt_at = now() - interval '1 second' where id = ?`, [pending.result.transactionId]);
+    const restartedWorker = new PendingReferenceWorker(wagers, () => new Date());
+    expect((await restartedWorker.runOnce()).processed).toBe(1);
+    expect((await wagers.process(pending.input, pending.key)).status).toBe(WagerTransactionStatus.Processed);
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('rejects a late-arriving reference with mismatched identity and expires missing references auditably', async () => {
+    const playerA = id();
+    const walletA = await wallets.open({ playerId: playerA, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const providerId = `p-${id()}`;
+    const pendingInvalid = await pendingOperation(WagerTransactionKind.Refund, playerA, walletA.id, 'wrong-owner-bet', providerId);
+    const playerB = id();
+    const walletB = await wallets.open({ playerId: playerB, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    await wagers.process(betInput(walletB.id, playerB, {
+      providerId, externalTransactionId: 'wrong-owner-bet', roundId: pendingInvalid.input.roundId,
+      money: { amount: '10.00', currency: 'BRL' },
+    }), `wrong-ref:${id()}`);
+    await makeDue(pendingInvalid.result.transactionId);
+    const worker = new PendingReferenceWorker(wagers, () => new Date());
+    expect((await worker.runOnce()).rejected).toBe(1);
+    expect((await wagers.getById(pendingInvalid.result.transactionId))?.failureCode).toBe(FailureCode.ReferenceMismatch);
+
+    const missing = await pendingOperation(WagerTransactionKind.Rollback, playerA, walletA.id, 'never-arrives', providerId);
+    await orm.em.getConnection().execute(
+      `update wager_transactions set reference_expires_at = now() - interval '1 second', next_attempt_at = now() + interval '1 hour' where id = ?`,
+      [missing.result.transactionId]);
+    expect((await worker.runOnce()).rejected).toBe(1);
+    expect((await wagers.getById(missing.result.transactionId))?.failureCode).toBe(FailureCode.ReferenceExpired);
+    const [events] = await orm.em.getConnection().execute<Array<{ pending: string; rejected: string; ledger: string }>>(
+      `select (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionPendingReference')::text as pending,
+        (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionRejected')::text as rejected,
+        (select count(*) from wallet_ledger_entries where transaction_id = ?)::text as ledger`,
+      [missing.result.transactionId, missing.result.transactionId, missing.result.transactionId]);
+    expect(events).toEqual({ pending: '1', rejected: '1', ledger: '0' });
+  });
+
+  test('leases prevent two workers claiming one row and expired leases recover after worker restart', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const pending = await pendingOperation(WagerTransactionKind.Refund, playerId, wallet.id, 'lease-bet', `p-${id()}`);
+    await makeDue(pending.result.transactionId);
+    const now = new Date();
+    const claims = await Promise.all([
+      wagers.claimPending('worker-one', now, 1_000, 10),
+      wagers.claimPending('worker-two', now, 1_000, 10),
+    ]);
+    expect(claims.flat()).toEqual([pending.result.transactionId]);
+    const deadWorkerClaim = claims[0]!.length ? 'worker-one' : 'worker-two';
+    expect(await wagers.resumePending(pending.result.transactionId, deadWorkerClaim === 'worker-one' ? 'worker-two' : 'worker-one', now))
+      .toBe('skipped');
+    expect(await wagers.claimPending('worker-after-restart', new Date(now.getTime() + 1_001), 1_000, 10))
+      .toEqual([pending.result.transactionId]);
+    expect(await wagers.resumePending(pending.result.transactionId, 'worker-after-restart', new Date(now.getTime() + 1_001)))
+      .toBe('rescheduled');
+    const [row] = await orm.em.getConnection().execute<Array<{ attempts: number }>>(
+      `select pending_attempts as attempts from wager_transactions where id = ?`, [pending.result.transactionId]);
+    expect(row?.attempts).toBe(1);
   });
 });

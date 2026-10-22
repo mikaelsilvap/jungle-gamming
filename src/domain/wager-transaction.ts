@@ -230,10 +230,18 @@ export class WagerTransaction {
   }
 
   validateReference(reference: WagerTransaction, alreadyReversedBySameKind = false): void {
-    this.assertReferenceIdentity(reference);
+    this.validateReferenceCandidate(reference);
     if (reference.status !== WagerTransactionStatus.Processed) {
       fail(FailureCode.ReferenceNotProcessed, 'A reversal can only reference a PROCESSED transaction.');
     }
+    if (alreadyReversedBySameKind || reference.reversalKinds.has(this.kind)) {
+      fail(FailureCode.ReferenceAlreadyReversed, `This transaction has already been reversed by ${this.kind}.`);
+    }
+  }
+
+  /** Validates immutable identity and reversal shape even while a reference is pending. */
+  validateReferenceCandidate(reference: WagerTransaction): void {
+    this.assertReferenceIdentity(reference);
     const kindAllowed = this.kind === WagerTransactionKind.Refund
       ? reference.kind === WagerTransactionKind.Bet
       : this.kind === WagerTransactionKind.Rollback
@@ -243,12 +251,6 @@ export class WagerTransaction {
         : false;
     if (!kindAllowed) {
       fail(FailureCode.ReferenceKindNotAllowed, `${this.kind} cannot reverse ${reference.kind}.`);
-    }
-    if (alreadyReversedBySameKind) {
-      fail(FailureCode.ReferenceAlreadyReversed, `This transaction has already been reversed by ${this.kind}.`);
-    }
-    if (reference.reversalKinds.has(this.kind)) {
-      fail(FailureCode.ReferenceAlreadyReversed, `This transaction has already been reversed by ${this.kind}.`);
     }
     if (!this.money.equals(reference.money)) {
       fail(FailureCode.ReversalAmountMismatch, 'Reversal amount must equal the referenced transaction amount.');

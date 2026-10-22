@@ -34,6 +34,9 @@ export class WagerTransactionRecord {
   createdAt!: Date;
   pendingAttempts!: number;
   nextAttemptAt?: Date;
+  referenceExpiresAt?: Date;
+  claimedBy?: string;
+  lockedUntil?: Date;
 }
 
 export class WalletLedgerEntryRecord {
@@ -101,6 +104,8 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     resultCurrency: { type: 'char', length: 3, fieldName: 'result_currency', nullable: true },
     processedAt: { ...timestamp, fieldName: 'processed_at', nullable: true }, createdAt: { ...timestamp, fieldName: 'created_at' },
     pendingAttempts: { type: 'integer', fieldName: 'pending_attempts' }, nextAttemptAt: { ...timestamp, fieldName: 'next_attempt_at', nullable: true },
+    referenceExpiresAt: { ...timestamp, fieldName: 'reference_expires_at', nullable: true },
+    claimedBy: { ...text, fieldName: 'claimed_by', nullable: true }, lockedUntil: { ...timestamp, fieldName: 'locked_until', nullable: true },
   },
 });
 

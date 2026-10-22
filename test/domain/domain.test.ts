@@ -17,6 +17,7 @@ import {
   WagerTransactionRejected,
   WagerTransactionStatus,
 } from '../../src/domain';
+import { ReferenceRetryPolicy } from '../../src/wagering/reference-retry-policy';
 
 const now = new Date('2026-10-22T12:00:00.000Z');
 const money = (amount: string, currency = 'BRL') => Money.from({ amount, currency });
@@ -346,5 +347,30 @@ describe('Inbox, events, and outbox', () => {
     expect(outbox.isPending()).toBe(false);
     expect(outbox.isDue(new Date(now.getTime() + 10_000))).toBe(false);
     expectCode(() => outbox.scheduleRetry(now), FailureCode.InvalidOutboxMessage);
+  });
+});
+
+describe('ReferenceRetryPolicy', () => {
+  const policy = new ReferenceRetryPolicy();
+  const epoch = new Date('2026-01-01T00:00:00.000Z');
+
+  it('sets a 24-hour expiry and schedules the initial attempt after the base delay', () => {
+    expect(policy.expiresAt(epoch).toISOString()).toBe('2026-01-02T00:00:00.000Z');
+    expect(policy.initialAttemptAt(epoch).toISOString()).toBe('2026-01-01T00:01:00.000Z');
+  });
+
+  it('uses exponential delay, caps it, and never schedules beyond expiry', () => {
+    const expiry = policy.expiresAt(epoch);
+    expect(policy.nextAttemptAt(epoch, 1, expiry).getTime() - epoch.getTime()).toBe(120_000);
+    expect(policy.nextAttemptAt(epoch, 20, expiry).getTime() - epoch.getTime()).toBe(1_800_000);
+    expect(policy.nextAttemptAt(expiry, 1, expiry).getTime()).toBe(expiry.getTime());
+  });
+
+  it('expires at the deadline and allows enough retries to span the full TTL', () => {
+    const expiry = policy.expiresAt(epoch);
+    expect(policy.isExpired(new Date(expiry.getTime() - 1), expiry)).toBe(false);
+    expect(policy.isExpired(expiry, expiry)).toBe(true);
+    expect(policy.hasExhaustedAttempts(63)).toBe(false);
+    expect(policy.hasExhaustedAttempts(64)).toBe(true);
   });
 });

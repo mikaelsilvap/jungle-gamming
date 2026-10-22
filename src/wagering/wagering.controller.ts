@@ -38,7 +38,15 @@ export class WageringController {
       money: { amount: raw.money.amount, currency: raw.money.currency },
       ...(raw.referenceExternalTransactionId === undefined ? {} : { referenceExternalTransactionId: requiredString(raw, 'referenceExternalTransactionId') }),
     };
-    try { return present(await this.wagers.process(input, key)); }
+    try {
+      const result = await this.wagers.process(input, key);
+      const testDelay = process.env.WAGER_TEST_ENABLE_FAULTS === 'true'
+        ? Number.parseInt(process.env.WAGER_TEST_RESPONSE_DELAY_MS ?? '0', 10) : 0;
+      if (Number.isSafeInteger(testDelay) && testDelay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(testDelay, 60_000)));
+      }
+      return present(result);
+    }
     catch (error) {
       if (error instanceof IdempotencyConflictError) throw new ConflictException({ code: error.code, message: error.message });
       if (error instanceof ExternalTransactionConflictError) throw new ConflictException({ code: error.code, message: error.message });

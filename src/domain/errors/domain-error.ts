@@ -8,6 +8,8 @@ export enum FailureCode {
   OpeningTransactionIsInternal = 'OPENING_TRANSACTION_IS_INTERNAL',
   ReferenceRequired = 'REFERENCE_REQUIRED',
   ReferenceNotFound = 'REFERENCE_NOT_FOUND',
+  ReferenceExpired = 'REFERENCE_EXPIRED',
+  ReferenceRetryExhausted = 'REFERENCE_RETRY_EXHAUSTED',
   ReferenceMismatch = 'REFERENCE_MISMATCH',
   ReferenceKindNotAllowed = 'REFERENCE_KIND_NOT_ALLOWED',
   ReferenceNotProcessed = 'REFERENCE_NOT_PROCESSED',

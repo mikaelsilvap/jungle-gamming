@@ -55,5 +55,15 @@ services:
       retries: 10
       start_period: 10s
 
+  pending-reference-worker:
+    build: .
+    command: ["bun", "run", "dist/src/wagering/pending-reference-worker.main.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wagering_app}:${POSTGRES_PASSWORD:-local_only_change_me}@postgres:5432/${POSTGRES_DB:-wagering}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data:
