@@ -73,3 +73,11 @@ Status: accepted and implemented in Phase 2.
 Create wallet, optional internal `OPENING` wager, and optional initial `CREDIT` ledger row in one `EntityManager.transactional()` callback. A zero-balance wallet has version 1 and no artificial ledger entry. Database uniqueness resolves concurrent player/currency creation; all rows from a losing opening attempt roll back. Reconciliation uses a repeatable-read transaction and only reports stored and ledger-derived values; it does not repair discrepancies.
 
 The application use case depends on `WalletPersistencePort`; `WalletPostgresAdapter` implements that port. This keeps MikroORM, raw SQL, and PostgreSQL exception handling out of the application and domain layers.
+
+## ADR-013 — Pending reference recovery
+
+Status: accepted and implemented in Phase 4.
+
+Persist each pending reversal's expiry, next-attempt time, attempt count, and temporary worker lease in PostgreSQL. Workers claim batches with `FOR UPDATE SKIP LOCKED`; a lease lets another process recover work after a crash. The worker acquires the wallet lock before wager/reference locks, then reuses the domain transition and reference validation rules. Retry policy is 60-second initial delay, exponential backoff capped at 30 minutes, a 24-hour TTL, and 64 maximum attempts. Expiry and terminal failures are recorded as rejected outcomes. Reschedules do not add another pending event; final outcome, optional ledger entry, response snapshot, and outbox events commit atomically. These settings are operational defaults and can be revisited from observed provider latency.
+
+The migration backfills pre-existing pending rows with the same TTL and initial delay. The worker is a standalone local Compose process. SQS consumption and outbox publishing remain outside this phase.
