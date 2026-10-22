@@ -20,25 +20,25 @@ Represent domain money as integer minor units using `bigint` and expose fixed-sc
 
 ## ADR-004 — Wallet concurrency
 
-Status: accepted for future wager mutations; wallet opening is protected by database uniqueness.
+Status: accepted and implemented for Phase 3 wager mutations; wallet opening is protected by database uniqueness.
 
 Serialize operations on one existing wallet using a PostgreSQL row lock (`SELECT ... FOR UPDATE`) inside the same transaction as wager, wallet, and ledger writes. Distinct wallets remain independently processable; there is no global lock. Wallet opening cannot lock a row that does not yet exist and instead relies on `UNIQUE(player_id,currency)`. The actual wager lock is implemented in Phase 3 with the wager use case.
 
 ## ADR-005 — Financial atomicity and ledger
 
-Status: accepted for wallet opening in Phase 2; SQS inbox and outbox coordination remain later work.
+Status: accepted and implemented for wallet opening and Phase 3 wagers. Financial result, balance, optional ledger, and outbox writes commit together; SQS inbox coordination remains later work.
 
 Commit wallet, wager transaction, append-only ledger, SQS inbox when applicable, and outbox together. Publish outbox events only after commit. Enforce database constraints and ledger immutability in PostgreSQL.
 
 ## ADR-006 — Persistent idempotency
 
-Status: proposed.
+Status: accepted and implemented in Phase 3.
 
-Use unique database keys and a SHA-256 hash of canonical business fields. Persist the original response snapshot so a replay returns the original observed balance.
+Use unique database keys and a SHA-256 hash of recursively sorted canonical business fields. Persist the original response snapshot so a replay returns the original observed balance. Same-key/different-hash is HTTP 409; same-key/same-hash is replay; pending-reference replays remain pending with the original acceptance snapshot.
 
 ## ADR-007 — HTTP and SQS share the use case
 
-Status: proposed.
+Status: accepted for the HTTP adapter and future SQS adapter.
 
 HTTP and SQS adapters will invoke one `ProcessWager` application use case. SQS acknowledgment follows the database commit.
 

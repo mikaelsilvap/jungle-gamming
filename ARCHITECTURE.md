@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 2 adds PostgreSQL persistence without changing the domain boundary. The financial domain lives under `src/domain` and includes exact money, wallet and ledger behavior, wager state transitions, inbox and outbox state, and versioned integration events. The domain imports no NestJS, ORM, PostgreSQL, or SQS packages.
+Phase 3 adds PostgreSQL-backed wager processing, persistent idempotency, wallet-scoped locking, REST submission and lookup, and transactional outbox writes. The financial domain lives under `src/domain` and imports no NestJS, ORM, PostgreSQL, or SQS packages.
 
 ## Initial decisions
 
@@ -33,4 +33,14 @@ The `GET /wallets/:walletId/ledger` cursor is opaque base64url over `(createdAt,
 
 `bun run db:migrate` applies migrations. `bun run db:rollback` reverses the latest migration. Migrations are not automatically run by API startup. PostgreSQL-backed tests use an explicitly named disposable database (`wagering_phase2_test`) and verify `up → down → up` before exercising SQL guarantees. `docker-compose.yml` gives the API a container-network database URL; local Bun commands use the `DATABASE_URL` in `.env.example`.
 
-Processing BET/WIN/LOSS/REFUND/ROLLBACK requests, applying the planned per-wallet `SELECT ... FOR UPDATE` lock to wager races, persistent inbox/outbox workflows, event publication, SQS consumers, and crash recovery remain future phases. The lock strategy is accepted as a PostgreSQL row lock inside the same unit-of-work transaction; wallet opening uses the unique key because there is no existing wallet row to lock. Phase 2 prepares the persistence port and transaction boundary without implementing the Phase 3 wager processor.
+The wallet-opening use case depends on `WalletPersistencePort`; `WalletPostgresAdapter` implements that port. The shared `ProcessWagerService` owns the MikroORM transaction boundary so the HTTP route and future queue adapter can invoke the same processing implementation. Domain rules remain in the existing aggregates; no SQS publisher or consumer is included.
+
+## Phase 3 wagering consistency
+
+`POST /wagering/transactions` requires `Idempotency-Key`. The service hashes canonical JSON with recursively sorted object keys over normalized business request fields; transport headers are excluded. PostgreSQL constraints on `(provider_id,idempotency_key)` and `(provider_id,external_transaction_id)` remain the final deduplication authority. Identical replays read the stored response snapshot, including its original balance; key reuse with a different hash returns 409. A pending-reference replay retains its original pending status and accepted balance snapshot.
+
+Each operation runs in one PostgreSQL transaction. The wallet row is locked using `SELECT ... FOR UPDATE` before reading or changing its balance. Distinct wallets do not share a lock. Deadlock and serialization errors are retried twice after the initial attempt; exhausted transient retries map to HTTP 503. Wallet is the first lock; a referenced wager on that wallet is locked next. No external call occurs inside the transaction.
+
+Processed, rejected, and pending-reference outcomes persist with stable failure codes and response balance snapshots. BET debits; WIN and REFUND credit; LOSS records no ledger or balance event; ROLLBACK reverses the referenced financial direction. Reversals require an existing processed reference, exact amount equality, matching provider/player/wallet/round/currency, and the database partial unique reversal index. Missing REFUND/ROLLBACK references persist as `PENDING_REFERENCE`, without ledger movement; worker, backoff, TTL, and automatic reprocessing remain future work.
+
+Financial result, wallet update, optional immutable ledger row, and corresponding outbox envelopes share the same commit. `WalletBalanceChanged` is stored only when balance changed. Positive wallet opening now also writes `WagerTransactionProcessed` and `WalletBalanceChanged` in its existing atomic transaction. The outbox publisher and SQS integration are future phases.
