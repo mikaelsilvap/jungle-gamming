@@ -32,13 +32,21 @@ docker compose up -d --build
 docker compose ps
 ```
 
-The Compose stack starts PostgreSQL, LocalStack SQS, and the NestJS liveness endpoint. The LocalStack health check accepts the SQS states returned by supported LocalStack releases. Verify the API with:
+The Compose stack starts PostgreSQL, LocalStack SQS, the NestJS API, the pending-reference worker, the wager SQS consumer, and the transactional outbox publisher. LocalStack creates the command FIFO, its DLQ, and the separate event FIFO. The worker processes use the same PostgreSQL database and retry while it is unavailable; apply migrations before submitting financial work. The LocalStack health check accepts the SQS states returned by supported LocalStack releases. Verify the API with:
 
 ```bash
 bun run smoke
 ```
 
 Stop the stack with `docker compose down`. The PostgreSQL volume is retained; use `docker compose down -v` only when intentionally deleting local database state.
+
+Inspect messaging process logs with:
+
+```bash
+docker compose logs -f sqs-consumer outbox-publisher pending-reference-worker
+```
+
+To check that an outbox event is flowing locally, submit a wallet or wager operation after applying migrations, then inspect the publisher logs and receive from `wager-events.fifo` with the LocalStack AWS CLI. The publisher sends only events already committed to PostgreSQL. Duplicate event delivery is expected after a publisher crash between SQS confirmation and the `published_at` update; downstream consumers must persistently deduplicate using `eventId`.
 
 ## Apply PostgreSQL migrations
 

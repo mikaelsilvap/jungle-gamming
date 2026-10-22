@@ -88,7 +88,7 @@ Status: implementation and local validation complete for pending-reference recov
 
 ## Phase 5 — SQS consumer, Inbox, retry, and DLQ
 
-Status: implementation complete; PostgreSQL and LocalStack integration gate passed. Operational SIGTERM and independent-process restart scenarios are recorded separately below.
+Status: implementation and crash/restart integration gate passed against PostgreSQL and LocalStack.
 
 - Added an AWS SDK v3 standalone FIFO consumer and Compose service. It long-polls the command queue, validates the README envelope, uses a stable consumer identity, renews visibility while processing, and drains active work on SIGTERM.
 - Extended the existing shared `ProcessWagerService` with an Inbox-aware entry point. Inbox identity, canonical full-envelope SHA-256, financial transaction, wallet/ledger changes, response state, and outbox events are finalized in the same PostgreSQL transaction. The HTTP processing contract remains unchanged.
@@ -96,11 +96,27 @@ Status: implementation complete; PostgreSQL and LocalStack integration gate pass
 - Durable business rejection and pending-reference acceptance are acknowledged after commit. The pending-reference worker later resumes the operation. Transient failures use exponential SQS visibility (1 second base, capped at 30 seconds); permanent invalid messages use the queue's native redrive policy (`maxReceiveCount=5`). Command queue visibility is 60 seconds, with long polling at 20 seconds and a heartbeat during processing. Messages within one FIFO group remain ordered; different groups can progress concurrently.
 - Added real PostgreSQL + LocalStack FIFO integration coverage for valid messages, repeated message IDs, business idempotency across message IDs, divergent payload, insufficient funds, same-wallet competition, independent wallets, pending reference recovery, PostgreSQL serialization retry, post-commit DeleteMessage failure/redelivery, and poison message DLQ.
 - Added real-queue integration cases for two independent consumer instances processing separate FIFO groups and for stopping/draining a committed in-flight delivery.
-- Final `bun test` against Docker PostgreSQL 17 and LocalStack 4.12.0: PASS, 73 tests / 317 expectations, including all domain, persistence, wagering, pending-reference, and SQS cases. A first unrestricted `bun test` attempt was refused because it targeted the development database; the safety guard prevented any test from running there, and the rerun with the explicitly disposable database passed.
+- Resumed the outstanding Phase 5 audit: a standalone Bun consumer process was SIGKILLed after PostgreSQL committed the Inbox and before SQS ACK. A separately started consumer received the expired-visibility message, logged the Inbox duplicate, acknowledged it, and retained exactly one wager, one ledger entry, and a reconciled wallet.
+- Final `bun test` against Docker PostgreSQL 17 and LocalStack 4.12.0: PASS, 80 tests / 385 expectations, including all domain, persistence, wagering, pending-reference, SQS, abrupt consumer process-crash/restart, and outbox publisher cases. A first unrestricted `bun test` attempt was refused because it targeted the development database; the safety guard prevented any test from running there, and the rerun with the explicitly disposable database passed.
 - `bun run typecheck`: PASS; `bun run build`: PASS; `docker compose config --quiet`: PASS; `docker compose build sqs-consumer`: PASS; `git diff --check`: PASS.
 - Started the compiled `sqs-consumer` Compose service and stopped it with Docker's SIGTERM path; logs confirmed ORM startup and `wager_sqs_shutdown_complete`. The in-flight drain behavior was also exercised with a real SQS delivery and PostgreSQL Inbox commit by stopping the consumer loop while the post-commit pause was active; it acknowledged the message and left one reconciled financial effect.
 - Restarted LocalStack to execute `localstack/init/ready.d/10-create-wager-queues.sh`; the init log ended with `Ready.` and queue inspection confirmed visibility 60 seconds and redrive to the FIFO DLQ at five receives.
-- No outbox publisher, SNS, dashboard, frontend, authentication, Kubernetes, or Terraform was added. Outbox publication remains Phase 6.
+- No SNS, dashboard, frontend, authentication, Kubernetes, or Terraform was added.
+
+## Phase 6 — Transactional outbox publisher
+
+Status: implementation and local verification complete.
+
+- Added a separate AWS SDK v3 publisher process and Compose service for `wager-events.fifo`.
+- Added reversible `Migration20261022150000` with identity-backed `publication_order`, `last_error`, and per-aggregate pending-order index. Existing `attempts`, `next_attempt_at`, claim owner, expiry, and due index are reused.
+- Claims use a short `FOR UPDATE SKIP LOCKED` transaction and persistent per-claim tokens. Network sends occur after the claim transaction commits. A stale claim cannot update `published_at` or retry fields after another publisher takes over.
+- Only the first unpublished event for a wallet is eligible, preserving the transactionally assigned per-wallet publication order across publisher processes. Different wallet aggregates remain independently claimable.
+- Events preserve their stored versioned JSON envelope and event ID; SQS deduplication ID is the event ID and message group is the wallet aggregate. Delivery remains at-least-once; consumers must persistently deduplicate by event ID.
+- Failures persist attempts, capped exponential retry time, and bounded `last_error`; events are never discarded or permanently paused after a fixed attempt count.
+- Focused `bun test ... --test-name-pattern='transactional outbox publisher'`: PASS, 6 tests / 62 expectations against PostgreSQL and LocalStack. Covered all four event types, per-wallet ordering, no uncommitted publish, confirmed-send mark, actual connection refusal and retry/recovery, two publishers, stale-claim fencing, process crash before send and after send, persistent downstream deduplication, and in-flight SIGTERM completion.
+- `Migration20261022150000` passed up → down → up in the disposable integration database. The default local database also rolled back and reapplied the migration; 50 existing outbox rows received distinct publication order values, and all 50 were published with zero pending rows.
+- Two built Compose publisher containers were active concurrently. Together they published the 50 pre-existing local outbox events to `wager-events.fifo`; the default database showed `0` pending / `50` published. Both containers logged `outbox_shutdown_complete` after SIGTERM.
+- Final `bun run typecheck`, `bun run build`, `docker compose config --quiet`, `docker compose build outbox-publisher`, and `git diff --check`: PASS. No push or remote change was performed.
 
 ## Later phases
 
