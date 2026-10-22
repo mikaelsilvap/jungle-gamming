@@ -4,6 +4,6 @@
     "noEmit": true,
     "types": ["node", "bun-types"]
   },
-  "include": ["src/domain/**/*.ts", "test/**/*.ts"],
+  "include": ["src/domain/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

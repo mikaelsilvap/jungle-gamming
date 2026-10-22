@@ -20,6 +20,7 @@
     "db:rollback": "bun run src/persistence/migrate.ts down",
     "db:migrate:production": "MIKRO_ORM_MIGRATIONS_PATH=dist bun run dist/src/persistence/migrate.js up",
     "test:integration": "bun test test/integration",
+    "validate": "bash scripts/validate.sh",
     "smoke": "bash scripts/smoke.sh"
   },
   "dependencies": {

@@ -25,7 +25,7 @@ services:
       AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
       PERSISTENCE: "0"
     ports:
-      - "127.0.0.1:4566:4566"
+      - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
     volumes:
       - ./localstack/init/ready.d:/etc/localstack/init/ready.d:ro
     healthcheck:
@@ -48,7 +48,7 @@ services:
       SQS_DLQ_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
       DATABASE_URL: postgresql://${POSTGRES_USER:-wagering_app}:${POSTGRES_PASSWORD:-local_only_change_me}@postgres:5432/${POSTGRES_DB:-wagering}
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${API_HOST_PORT:-3000}:3000"
     depends_on:
       postgres:
         condition: service_healthy
