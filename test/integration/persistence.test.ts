@@ -458,14 +458,22 @@ describe('PostgreSQL pending-reference worker phase 4', () => {
       money: { amount: '10.00', currency: 'BRL' },
     });
     expect((await wagers.process(bet, `late-bet-key:${id()}`)).status).toBe(WagerTransactionStatus.Processed);
+    const interveningBet = betInput(wallet.id, playerId, {
+      providerId, externalTransactionId: 'intervening-bet', roundId: pending.input.roundId,
+      money: { amount: '5.00', currency: 'BRL' },
+    });
+    expect((await wagers.process(interveningBet, `intervening-key:${id()}`)).status).toBe(WagerTransactionStatus.Processed);
     await makeDue(pending.result.transactionId);
     const worker = new PendingReferenceWorker(wagers, () => new Date());
     const summary = await worker.runOnce();
     expect(summary.processed).toBe(1);
     const replay = await wagers.process(pending.input, pending.key);
-    expect(replay.status).toBe(WagerTransactionStatus.Processed);
+    expect(replay.status).toBe(WagerTransactionStatus.PendingReference);
     expect(replay.idempotentReplay).toBe(true);
     expect(replay.balance.amount).toBe('100.00');
+    const current = await wagers.getById(pending.result.transactionId);
+    expect(current?.status).toBe(WagerTransactionStatus.Processed);
+    expect(current?.balance.amount).toBe('95.00');
     const [counts] = await orm.em.getConnection().execute<Array<{ entries: string; pendingEvents: string; processedEvents: string; balanceEvents: string }>>(
       `select (select count(*) from wallet_ledger_entries where transaction_id = ?)::text as entries,
        (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionPendingReference')::text as "pendingEvents",
@@ -515,7 +523,7 @@ describe('PostgreSQL pending-reference worker phase 4', () => {
       `update wager_transactions set next_attempt_at = now() - interval '1 second' where id = ?`, [pending.result.transactionId]);
     const restartedWorker = new PendingReferenceWorker(wagers, () => new Date());
     expect((await restartedWorker.runOnce()).processed).toBe(1);
-    expect((await wagers.process(pending.input, pending.key)).status).toBe(WagerTransactionStatus.Processed);
+    expect((await wagers.process(pending.input, pending.key)).status).toBe(WagerTransactionStatus.PendingReference);
     expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
   });
 

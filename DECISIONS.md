@@ -34,7 +34,7 @@ Commit wallet, wager transaction, append-only ledger, SQS inbox when applicable,
 
 Status: accepted and implemented in Phase 3.
 
-Use unique database keys and a SHA-256 hash of recursively sorted canonical business fields. Persist the original response snapshot so a replay returns the original observed balance. Same-key/different-hash is HTTP 409; same-key/same-hash is replay; pending-reference replays remain pending with the original acceptance snapshot.
+Use unique database keys and a SHA-256 hash of recursively sorted canonical business fields. Persist the original response status and balance so a replay returns the original response. Same-key/different-hash is HTTP 409; same-key/same-hash is replay; pending-reference replays retain their original PENDING_REFERENCE status and acceptance snapshot after background resolution. Transaction lookup reports current transaction status and the persisted outcome balance, not the wallet's live balance.
 
 ## ADR-007 — HTTP and SQS share the use case
 
