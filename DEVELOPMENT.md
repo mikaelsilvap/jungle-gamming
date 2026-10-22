@@ -85,3 +85,15 @@ bun run test:integration
 The suite performs migration `up → down → up` and leaves its disposable schema populated with test records. It never drops or truncates the normal `wagering` database.
 
 With the two environment variables above exported, run the full suite with `bun test`. CI provisions the same disposable PostgreSQL database automatically.
+
+## Run clean-room validation
+
+For a disposable stack that does not reuse the development database or ports, run:
+
+```bash
+bun run validate
+```
+
+The script requires Bun 1.4.3 and Docker Compose. It creates a uniquely named Compose project, uses a disposable PostgreSQL volume and database, reserves host ports 25432 (PostgreSQL), 24566 (LocalStack), and 23000 (API) by default, applies migrations, builds and starts all services, runs the full PostgreSQL/LocalStack test suite, then verifies HTTP, SQS, outbox, ledger reconciliation, and dependency outage/recovery. It removes only that validation project and volume when it exits. Set `VALIDATION_POSTGRES_PORT`, `VALIDATION_LOCALSTACK_PORT`, or `VALIDATION_API_PORT` to avoid local port conflicts. Set `KEEP_VALIDATION_STACK=true` only when intentionally retaining the isolated stack for diagnosis.
+
+The same command is the CI validation entry point. It must be run with Docker access because tests and outage checks use real PostgreSQL and LocalStack services.

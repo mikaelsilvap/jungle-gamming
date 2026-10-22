@@ -132,6 +132,19 @@ Status: implementation and local verification complete for process-local observa
 - Runtime smoke PASS: API `/health/live`, `/health/ready`, and `/metrics` returned HTTP 200; each worker's private `/health/live`, `/health/ready`, and `/metrics` endpoint returned HTTP 200. API readiness reported PostgreSQL and SQS up, zero pending outbox rows, zero lag, and zero DLQ messages.
 - Dashboards, centralized metrics aggregation, alerting, and cross-replica metric aggregation remain outside this phase.
 
+## Phase 8 — Final audit, hardening, and delivery preparation
+
+Status: local audit and clean-room validation complete; external submission remains pending review and authorization.
+
+- Replaced the challenge-statement README with evaluator-facing English documentation and expanded the architecture guide with the service boundaries, consistency guarantees, and operational limits.
+- Added `scripts/validate.sh` as the shared clean-room command for CI and local review. It uses a uniquely named disposable Compose project and database, runs frozen install/typecheck/build, migrations and the full PostgreSQL/LocalStack suite, then exercises HTTP/SQS/Outbox reconciliation and real dependency outage/recovery. It removes only its own stack unless explicitly retained for diagnosis.
+- Updated CI to call the same clean-room validation entry point, pinned Bun, and granted the workflow read-only repository permissions.
+- Final clean-room run: PASS, Bun 1.4.3, 86 tests / 435 expectations, migrations up-down-up, all service images healthy, HTTP operations and SQS event publication verified, and PostgreSQL/LocalStack readiness recovered from HTTP 503 to 200 after real container outages.
+- The end-to-end smoke initially selected the later `WalletBalanceChanged` event for the same transaction. It now matches `WagerTransactionProcessed`; the full clean-room validation passed after correction.
+- Added `reports/final-audit.md` with evidence traceability, findings, limitations, and remote-state caveats. Added a Portuguese technical defense guide outside the repository at `/home/magalu/Documents/Codex/Jungle Gaming - Guia de Defesa Técnica.md`.
+- A local pattern scan found no obvious credentials in the tracked worktree/history. A dedicated scanner was unavailable, so dedicated secret scanning is NOT_RUN.
+- GitHub repository/branch/hosted-CI status is BLOCKED because no authentication was available. The configured remote was not modified, and no push or submission was performed.
+
 ## Later phases
 
-Phase 8 and later: not started. See `implementationPlan.md` in the local workspace; it is intentionally excluded from the evaluation repository.
+No later implementation phase was started. See `implementationPlan.md` in the local workspace; it is intentionally excluded from the evaluation repository.
