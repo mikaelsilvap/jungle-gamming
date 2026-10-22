@@ -36,9 +36,24 @@ Status: complete for the in-memory domain scope.
 
 Commit: `feat(domain): implement precise money and wagering invariants`.
 
-## Phase 2
+## Phase 2 — PostgreSQL persistence, migrations, and atomic wallet opening
 
-Not started. PostgreSQL mappings, schema constraints, reversible migrations, and wallet persistence remain pending.
+Status: implementation complete; persistence integration gate passed against PostgreSQL 17.11 in Docker.
+
+- Added MikroORM 7.2.0, PostgreSQL driver, migration extension, five persistence record mappings, and explicit `rehydrate` mappers. Domain files remain independent of NestJS and persistence libraries.
+- Separated `WalletOpeningService` from `WalletPostgresAdapter` through `WalletPersistencePort`. The adapter owns SQL, transaction scope, and database error mapping; the application service constructs domain objects without importing MikroORM.
+- Added reversible `Migration20261022090000` for wallets, wagers, ledger, inbox, and outbox, `Migration20261022100000` for stable ledger cursor indexing and append-only TRUNCATE protection, and `Migration20261022110000` for child-side FK indexes. The schema enforces wallet/player/currency uniqueness, non-negative balance, valid versions, provider idempotency/external identity uniqueness, ledger uniqueness and arithmetic, and a partial unique guard for each processed reversal kind/reference.
+- Added exact `NUMERIC(38,2)` adapters using decimal text and no JavaScript numeric conversion for money.
+- Added transactional wallet opening and `POST /wallets`: zero balance creates no artificial wager/ledger; positive opening creates one internal processed `OPENING` and one `CREDIT`; concurrent duplicate openings are serialized by the unique database constraint and the losing transaction is rolled back.
+- Added wallet lookup, stable cursor ledger listing, and read-only repeatable-read reconciliation as specified by the implementation plan.
+- Added dedicated PostgreSQL integration tests. An injected database trigger failure verified rollback removes the wallet, opening wager, and ledger together.
+- Integration test command: `DATABASE_URL=postgresql://wagering_app:local_only_change_me@127.0.0.1:5432/wagering_phase2_test TEST_DATABASE_NAME=wagering_phase2_test bun run test:integration` — PASS, 11 tests / 40 expectations. The suite runs the full migration chain up, down to zero, then up again.
+- `DATABASE_URL=... TEST_DATABASE_NAME=... bun test` — PASS, 45 tests / 185 expectations, including all domain unit tests and PostgreSQL integrations.
+- `bun install --frozen-lockfile`, `bun run typecheck`, `bun run build`, `docker compose config`, and `git diff --check` — PASS.
+- Docker Compose rebuilt successfully; the API and PostgreSQL reported healthy. The compiled migration command ran against the Compose database, and the temporary API instance returned POST wallet 201, duplicate wallet 409, GET wallet 200, GET ledger 200, and POST reconciliation 200 with `consistent: true` and zero difference.
+- Created the explicitly disposable `wagering_phase2_test` database for integrations. The regular local `wagering` database received the approved migrations and no demonstration wallet or transaction rows.
+
+Commits: `feat(persistence): add PostgreSQL schema and mappings`; `feat(wallets): add atomic wallet opening and integration coverage`.
 
 ## Later phases
 

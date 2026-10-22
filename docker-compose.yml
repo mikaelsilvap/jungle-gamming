@@ -40,6 +40,7 @@ services:
     environment:
       NODE_ENV: development
       PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wagering_app}:${POSTGRES_PASSWORD:-local_only_change_me}@postgres:5432/${POSTGRES_DB:-wagering}
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:

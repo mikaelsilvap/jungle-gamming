@@ -39,3 +39,29 @@ bun run smoke
 ```
 
 Stop the stack with `docker compose down`. The PostgreSQL volume is retained; use `docker compose down -v` only when intentionally deleting local database state.
+
+## Apply PostgreSQL migrations
+
+The API does not run schema changes implicitly. After the stack is healthy, apply the checked-in migrations:
+
+```bash
+export DATABASE_URL=postgresql://wagering_app:local_only_change_me@localhost:5432/wagering
+bun run db:migrate
+```
+
+Use `bun run db:rollback` only against a local development database when intentionally reverting the latest migration.
+
+## Run persistence integration tests
+
+The integration suite refuses to run against a database other than `wagering_phase2_test`. Create this disposable database once in the local Postgres container, then use:
+
+```bash
+docker exec jungle-wagering-postgres-1 createdb -U wagering_app wagering_phase2_test
+export TEST_DATABASE_NAME=wagering_phase2_test
+export DATABASE_URL=postgresql://wagering_app:local_only_change_me@localhost:5432/wagering_phase2_test
+bun run test:integration
+```
+
+The suite performs migration `up → down → up` and leaves its disposable schema populated with test records. It never drops or truncates the normal `wagering` database.
+
+With the two environment variables above exported, run the full suite with `bun test`. CI provisions the same disposable PostgreSQL database automatically.

@@ -11,6 +11,23 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.11-alpine3.24
+        env:
+          POSTGRES_DB: wagering_phase2_test
+          POSTGRES_USER: wagering_app
+          POSTGRES_PASSWORD: local_only_change_me
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wagering_app -d wagering_phase2_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://wagering_app:local_only_change_me@localhost:5432/wagering_phase2_test
+      TEST_DATABASE_NAME: wagering_phase2_test
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2

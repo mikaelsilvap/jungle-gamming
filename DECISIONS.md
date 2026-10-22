@@ -20,13 +20,13 @@ Represent domain money as integer minor units using `bigint` and expose fixed-sc
 
 ## ADR-004 — Wallet concurrency
 
-Status: proposed; database serialization is not implemented yet.
+Status: accepted for future wager mutations; wallet opening is protected by database uniqueness.
 
-Serialize operations on one wallet using a PostgreSQL row lock inside the same transaction as wager, wallet, and ledger writes. Distinct wallets remain independently processable.
+Serialize operations on one existing wallet using a PostgreSQL row lock (`SELECT ... FOR UPDATE`) inside the same transaction as wager, wallet, and ledger writes. Distinct wallets remain independently processable; there is no global lock. Wallet opening cannot lock a row that does not yet exist and instead relies on `UNIQUE(player_id,currency)`. The actual wager lock is implemented in Phase 3 with the wager use case.
 
 ## ADR-005 — Financial atomicity and ledger
 
-Status: proposed.
+Status: accepted for wallet opening in Phase 2; SQS inbox and outbox coordination remain later work.
 
 Commit wallet, wager transaction, append-only ledger, SQS inbox when applicable, and outbox together. Publish outbox events only after commit. Enforce database constraints and ledger immutability in PostgreSQL.
 
@@ -59,3 +59,17 @@ Do not implement custom authentication or an identity provider in this timebox. 
 Status: accepted for the domain layer.
 
 Exercise financial flows in BRL while keeping `Money` currency-aware and rejecting operations across different currencies. The domain validates ISO-4217 codes against the runtime's `Intl` currency data and checks that every arithmetic operation uses matching codes.
+
+## ADR-011 — MikroORM and exact PostgreSQL persistence
+
+Status: accepted and implemented in Phase 2.
+
+Use MikroORM 7.2.0 with persistence-only record classes and `EntitySchema` metadata. This keeps ORM decorators and database types out of the approved domain. Monetary values are stored in PostgreSQL `NUMERIC(38,2)` and passed to/from the domain as decimal strings. Migration SQL is versioned, reversible, and owns the financial checks, unique keys, foreign keys, partial reversal guard, indexes, and append-only ledger trigger.
+
+## ADR-012 — Atomic wallet opening and reconciliation
+
+Status: accepted and implemented in Phase 2.
+
+Create wallet, optional internal `OPENING` wager, and optional initial `CREDIT` ledger row in one `EntityManager.transactional()` callback. A zero-balance wallet has version 1 and no artificial ledger entry. Database uniqueness resolves concurrent player/currency creation; all rows from a losing opening attempt roll back. Reconciliation uses a repeatable-read transaction and only reports stored and ledger-derived values; it does not repair discrepancies.
+
+The application use case depends on `WalletPersistencePort`; `WalletPostgresAdapter` implements that port. This keeps MikroORM, raw SQL, and PostgreSQL exception handling out of the application and domain layers.
