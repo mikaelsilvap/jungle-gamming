@@ -12,6 +12,7 @@
     "start": "bun run dist/src/main.js",
     "start:dev": "bun --watch src/main.ts",
     "start:sqs-consumer": "bun run dist/src/messaging/wager-sqs-consumer.main.js",
+    "start:outbox-publisher": "bun run dist/src/messaging/outbox-publisher.main.js",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "test": "bun test",

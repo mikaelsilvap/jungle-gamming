@@ -85,5 +85,29 @@ services:
       localstack:
         condition: service_healthy
 
+  outbox-publisher:
+    build: .
+    command: ["bun", "run", "dist/src/messaging/outbox-publisher.main.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wagering_app}:${POSTGRES_PASSWORD:-local_only_change_me}@postgres:5432/${POSTGRES_DB:-wagering}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      SQS_ENDPOINT: http://localstack:4566
+      SQS_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/wager-events.fifo
+      OUTBOX_PUBLISHER_ID: ${OUTBOX_PUBLISHER_ID:-}
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-10}
+      OUTBOX_LEASE_MS: ${OUTBOX_LEASE_MS:-30000}
+      OUTBOX_RETRY_BASE_MS: ${OUTBOX_RETRY_BASE_MS:-1000}
+      OUTBOX_RETRY_MAXIMUM_MS: ${OUTBOX_RETRY_MAXIMUM_MS:-60000}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
+    stop_grace_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+
 volumes:
   postgres_data:

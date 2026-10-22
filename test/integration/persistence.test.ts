@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import {
-  CreateQueueCommand, DeleteQueueCommand, GetQueueAttributesCommand, ReceiveMessageCommand,
+  CreateQueueCommand, DeleteMessageCommand, DeleteQueueCommand, GetQueueAttributesCommand, ReceiveMessageCommand,
   SendMessageCommand, SQSClient,
 } from '@aws-sdk/client-sqs';
 import { FailureCode, Money, WagerTransactionKind, WagerTransactionStatus } from '../../src/domain';
@@ -20,6 +20,7 @@ import { ProcessWagerInput, ProcessWagerService } from '../../src/wagering/proce
 import { PendingReferenceWorker } from '../../src/wagering/pending-reference.worker';
 import { ReferenceRetryPolicy } from '../../src/wagering/reference-retry-policy';
 import { WagerSqsConsumer, createWagerSqsClient } from '../../src/messaging/wager-sqs-consumer';
+import { OutboxPublisher } from '../../src/messaging/outbox-publisher';
 
 const testDatabaseName = process.env.TEST_DATABASE_NAME ?? 'wagering_phase2_test';
 let orm: Awaited<ReturnType<typeof createOrm>>;
@@ -915,6 +916,91 @@ describe('PostgreSQL and LocalStack SQS consumer phase 5', () => {
     expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
   });
 
+  test('recovers a real process crash after SQL commit and before SQS ACK after restart', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = request(wallet.id, playerId, { providerId: `sqs-crash-${playerId}` });
+    const message = envelope(input);
+    await send(message, wallet.id);
+    const commonEnv = {
+      ...process.env,
+      DATABASE_URL: process.env.DATABASE_URL!,
+      SQS_ENDPOINT: endpoint,
+      SQS_COMMAND_QUEUE_URL: queueUrl,
+      SQS_VISIBILITY_TIMEOUT_SECONDS: '2',
+      SQS_CONSUMER_NAME: consumerName,
+      AWS_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'test',
+      AWS_SECRET_ACCESS_KEY: 'test',
+    };
+    function startProcess(pauseAfterCommitMs?: string) {
+      return Bun.spawn(['bun', 'run', 'dist/src/messaging/wager-sqs-consumer.main.js'], {
+        cwd: process.cwd(),
+        env: { ...commonEnv, WAGER_TEST_ENABLE_FAULTS: pauseAfterCommitMs ? 'true' : 'false',
+          ...(pauseAfterCommitMs ? { WAGER_TEST_PAUSE_AFTER_COMMIT_MS: pauseAfterCommitMs } : {}) },
+        stdout: 'pipe', stderr: 'pipe',
+      });
+    }
+    const firstProcess = startProcess('30000');
+    let firstOutput = '';
+    let secondOutput = '';
+    const readOutput = async (stream: ReadableStream<Uint8Array>, append: (text: string) => void) => {
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          append(decoder.decode(value, { stream: true }));
+        }
+      } finally { reader.releaseLock(); }
+    };
+    const firstReader = readOutput(firstProcess.stdout, (chunk) => { firstOutput += chunk; });
+    const firstErrorReader = readOutput(firstProcess.stderr, (chunk) => { firstOutput += chunk; });
+    let secondProcess: ReturnType<typeof startProcess> | undefined;
+    let secondReaders: Promise<void>[] = [];
+    try {
+      let committed = false;
+      for (let attempt = 0; attempt < 100 && !committed; attempt += 1) {
+        const [row] = await orm.em.getConnection().execute<Array<{ processed: boolean }>>(
+          `select processed_at is not null as processed from inbox_messages where consumer_name = ? and message_id = ?`,
+          [consumerName, message.messageId]);
+        committed = row?.processed === true;
+        if (!committed) await Bun.sleep(50);
+      }
+      expect(committed).toBe(true);
+      firstProcess.kill('SIGKILL');
+      await firstProcess.exited;
+      await Promise.all([firstReader, firstErrorReader]);
+      expect(firstOutput).not.toContain('wager_sqs_shutdown_complete');
+      await Bun.sleep(2_200);
+
+      secondProcess = startProcess();
+      secondReaders = [
+        readOutput(secondProcess.stdout, (chunk) => { secondOutput += chunk; }),
+        readOutput(secondProcess.stderr, (chunk) => { secondOutput += chunk; }),
+      ];
+      for (let attempt = 0; attempt < 100 && !secondOutput.includes('wager_sqs_inbox_duplicate'); attempt += 1) {
+        await Bun.sleep(100);
+      }
+      expect(secondOutput).toContain('wager_sqs_inbox_duplicate');
+    } finally {
+      if (firstProcess.exitCode === null) firstProcess.kill('SIGKILL');
+      if (secondProcess && secondProcess.exitCode === null) secondProcess.kill('SIGTERM');
+      await Promise.all([firstProcess.exited, ...(secondProcess ? [secondProcess.exited] : [])]);
+      await Promise.allSettled([firstReader, firstErrorReader, ...secondReaders]);
+    }
+    const [counts] = await orm.em.getConnection().execute<Array<{ inbox: string; wagers: string; ledger: string }>>(
+      `select (select count(*) from inbox_messages where consumer_name = ? and message_id = ?)::text as inbox,
+        (select count(*) from wager_transactions where provider_id = ? and external_transaction_id = ?)::text as wagers,
+        (select count(*) from wallet_ledger_entries l join wager_transactions w on w.id = l.transaction_id
+          where l.wallet_id = ? and w.kind <> 'OPENING')::text as ledger`,
+      [consumerName, message.messageId, input.providerId, input.externalTransactionId, wallet.id]);
+    expect(counts).toEqual({ inbox: '1', wagers: '1', ledger: '1' });
+    expect((await wallets.get(wallet.id))?.balance.amount).toBe('90.00');
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  }, 30_000);
+
   test('routes a permanently malformed FIFO message to its configured DLQ after the receive limit', async () => {
     await send('{ malformed json', 'poison-message-group');
     const worker = consumer(1, 1);
@@ -931,4 +1017,357 @@ describe('PostgreSQL and LocalStack SQS consumer phase 5', () => {
     expect(deliveries).toBeGreaterThanOrEqual(3);
     expect(deadLetterReceived).toBe(true);
   }, 15_000);
+});
+
+describe('PostgreSQL and LocalStack transactional outbox publisher phase 6', () => {
+  const endpoint = process.env.SQS_ENDPOINT ?? 'http://127.0.0.1:4566';
+  const sqs = new SQSClient({ endpoint, region: 'us-east-1', credentials: { accessKeyId: 'test', secretAccessKey: 'test' } });
+  let queueUrl = '';
+
+  function publisher(overrides: Partial<ConstructorParameters<typeof OutboxPublisher>[2]> = {}, client = sqs): OutboxPublisher {
+    return new OutboxPublisher(orm, client, { queueUrl, publisherId: `publisher-${id()}`, batchSize: 10,
+      leaseMs: 2_000, retryBaseMs: 50, retryMaximumMs: 200, ...overrides });
+  }
+
+  function event(aggregateId: string, eventType = 'WagerTransactionProcessed') {
+    const eventId = id();
+    return { eventId, eventType, aggregateId, correlationId: id(), occurredAt: new Date().toISOString(), version: 1,
+      data: { transactionId: id(), walletId: aggregateId, kind: 'BET', money: { amount: '1.00', currency: 'BRL' } } };
+  }
+
+  async function insertEvent(envelope: ReturnType<typeof event>): Promise<void> {
+    await orm.em.getConnection().execute(
+      `insert into outbox_messages (id, aggregate_id, event_type, payload, occurred_at, attempts)
+       values (?, ?, ?, ?, ?, 0)`,
+      [envelope.eventId, envelope.aggregateId, envelope.eventType, JSON.stringify(envelope), envelope.occurredAt]);
+  }
+
+  async function receive(maxMessages = 10) {
+    return await sqs.send(new ReceiveMessageCommand({ QueueUrl: queueUrl, MaxNumberOfMessages: maxMessages,
+      WaitTimeSeconds: 1, VisibilityTimeout: 2 }));
+  }
+
+  beforeEach(async () => {
+    if (queueUrl) await sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl }));
+    const suffix = randomUUID().replaceAll('-', '');
+    queueUrl = (await sqs.send(new CreateQueueCommand({ QueueName: `wager-events-test-${suffix}.fifo`, Attributes: {
+      FifoQueue: 'true', ContentBasedDeduplication: 'false', VisibilityTimeout: '2',
+    } }))).QueueUrl!;
+    await orm.em.getConnection().execute('delete from outbox_messages');
+    await orm.em.getConnection().execute(`create table if not exists outbox_test_receipts (
+      event_id uuid primary key, applied_at timestamptz not null default now())`);
+    await orm.em.getConnection().execute(`create table if not exists outbox_test_effects (
+      event_id uuid primary key references outbox_test_receipts(event_id), effect_count integer not null)`);
+    await orm.em.getConnection().execute('truncate outbox_test_effects, outbox_test_receipts');
+  });
+
+  afterAll(async () => {
+    if (queueUrl) await sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl }));
+    sqs.destroy();
+  });
+
+  test('publishes the financial event types in per-wallet order and only emits balance changes when balance moves', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const providerId = `outbox-${playerId}`;
+    const roundId = `round-${id()}`;
+    const gameId = 'outbox-integration-game';
+    const bet = { providerId, externalTransactionId: id(), playerId, walletId: wallet.id, roundId, gameId,
+      kind: WagerTransactionKind.Bet, money: { amount: '10.00', currency: 'BRL' } };
+    const betResult = await wagers.process(bet, `key:${id()}`);
+    await wagers.process({ ...bet, externalTransactionId: id(), kind: WagerTransactionKind.Win,
+      referenceExternalTransactionId: bet.externalTransactionId, money: { amount: '5.00', currency: 'BRL' } }, `key:${id()}`);
+    const loss = { ...bet, externalTransactionId: id(), kind: WagerTransactionKind.Loss, money: { amount: '1.00', currency: 'BRL' } };
+    const lossResult = await wagers.process(loss, `key:${id()}`);
+    await wagers.process({ ...bet, externalTransactionId: id(), money: { amount: '500.00', currency: 'BRL' } }, `key:${id()}`);
+    await wagers.process({ ...bet, externalTransactionId: id(), kind: WagerTransactionKind.Refund,
+      referenceExternalTransactionId: `missing-${id()}` }, `key:${id()}`);
+
+    const expected = ['WagerTransactionProcessed', 'WalletBalanceChanged', 'WagerTransactionProcessed', 'WalletBalanceChanged',
+      'WagerTransactionProcessed', 'WalletBalanceChanged', 'WagerTransactionProcessed', 'WagerTransactionRejected',
+      'WagerTransactionPendingReference'];
+    const observed: Array<{ eventId: string; eventType: string; aggregateId: string; data: Record<string, unknown> }> = [];
+    for (let attempt = 0; attempt < expected.length; attempt += 1) {
+      expect((await publisher().runOnce()).published).toBe(1);
+      const batch = await receive();
+      const message = batch.Messages?.[0];
+      expect(message).toBeDefined();
+      observed.push(JSON.parse(message!.Body!) as typeof observed[number]);
+      await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message!.ReceiptHandle! }));
+    }
+    expect(observed.map((item) => item.eventType)).toEqual(expected);
+    expect(observed.every((item) => item.aggregateId === wallet.id)).toBe(true);
+    expect(observed[0]?.eventId).toBe((await orm.em.getConnection().execute<Array<{ id: string }>>(
+      `select id::text as id from outbox_messages where aggregate_id = ? order by publication_order limit 1`, [wallet.id]))[0]?.id);
+    expect(observed.filter((item) => item.eventType === 'WalletBalanceChanged')).toHaveLength(3);
+    expect(observed.some((item) => item.eventType === 'WalletBalanceChanged'
+      && item.data.transactionId === lossResult.transactionId)).toBe(false);
+    const [state] = await orm.em.getConnection().execute<Array<{ pending: string; published: string; attempts: string }>>(
+      `select count(*) filter (where published_at is null)::text as pending,
+        count(*) filter (where published_at is not null)::text as published,
+        sum(attempts)::text as attempts from outbox_messages where aggregate_id = ?`, [wallet.id]);
+    expect(state).toEqual({ pending: '0', published: String(expected.length), attempts: '0' });
+    expect((await wallets.get(wallet.id))?.balance.amount).toBe('95.00');
+    expect(betResult.status).toBe(WagerTransactionStatus.Processed);
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('does not publish an uncommitted outbox row and marks published only after SQS confirmation', async () => {
+    const wallet = await wallets.open({ playerId: id(), initialBalance: { amount: '0.00', currency: 'BRL' } });
+    const envelope = event(wallet.id);
+    let release!: () => void;
+    let inserted!: () => void;
+    const insertedPromise = new Promise<void>((resolve) => { inserted = resolve; });
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const transaction = orm.em.transactional(async (em) => {
+      await em.execute(`insert into outbox_messages (id, aggregate_id, event_type, payload, occurred_at, attempts)
+        values (?, ?, ?, ?, ?, 0)`, [envelope.eventId, envelope.aggregateId, envelope.eventType,
+        JSON.stringify(envelope), envelope.occurredAt]);
+      inserted();
+      await hold;
+    });
+    await insertedPromise;
+    expect(await publisher().runOnce()).toEqual({ claimed: 0, published: 0, deferred: 0, staleClaims: 0 });
+    expect((await receive(1)).Messages ?? []).toEqual([]);
+    release();
+    await transaction;
+    expect(await publisher().runOnce()).toEqual({ claimed: 1, published: 1, deferred: 0, staleClaims: 0 });
+    expect((await receive(1)).Messages?.length).toBe(1);
+    const [row] = await orm.em.getConnection().execute<Array<{ published: boolean }>>(
+      `select published_at is not null as published from outbox_messages where id = ?`, [envelope.eventId]);
+    expect(row?.published).toBe(true);
+  });
+
+  test('persists retry count and capped backoff after SQS send failure, then publishes after recovery', async () => {
+    const wallet = await wallets.open({ playerId: id(), initialBalance: { amount: '0.00', currency: 'BRL' } });
+    const envelope = event(wallet.id);
+    await insertEvent(envelope);
+    const unavailableSqs = new SQSClient({ endpoint: 'http://127.0.0.1:4567', region: 'us-east-1',
+      credentials: { accessKeyId: 'test', secretAccessKey: 'test' }, maxAttempts: 1 });
+    try {
+      expect(await publisher({}, unavailableSqs).runOnce()).toEqual({ claimed: 1, published: 0, deferred: 1, staleClaims: 0 });
+    } finally {
+      unavailableSqs.destroy();
+    }
+    const [failed] = await orm.em.getConnection().execute<Array<{ attempts: number; nextAttemptAt: Date | string; lastError: string }>>(
+      `select attempts, next_attempt_at as "nextAttemptAt", last_error as "lastError" from outbox_messages where id = ?`, [envelope.eventId]);
+    expect(failed?.attempts).toBe(1);
+    expect(failed?.lastError.length).toBeGreaterThan(0);
+    expect(failed?.nextAttemptAt).toBeDefined();
+    expect(await publisher().runOnce()).toEqual({ claimed: 0, published: 0, deferred: 0, staleClaims: 0 });
+    await Bun.sleep(60);
+    expect(await publisher().runOnce()).toEqual({ claimed: 1, published: 1, deferred: 0, staleClaims: 0 });
+    expect(JSON.parse((await receive(1)).Messages?.[0]?.Body ?? '{}').eventId).toBe(envelope.eventId);
+    const [row] = await orm.em.getConnection().execute<Array<{ attempts: number; published: boolean; lastError: string | null }>>(
+      `select attempts, published_at is not null as published, last_error as "lastError" from outbox_messages where id = ?`, [envelope.eventId]);
+    expect(row).toEqual({ attempts: 1, published: true, lastError: null });
+  });
+
+  test('two publishers claim different aggregates and a stale claim cannot overwrite the current owner', async () => {
+    const firstWallet = await wallets.open({ playerId: id(), initialBalance: { amount: '0.00', currency: 'BRL' } });
+    const secondWallet = await wallets.open({ playerId: id(), initialBalance: { amount: '0.00', currency: 'BRL' } });
+    const first = event(firstWallet.id);
+    const second = event(secondWallet.id);
+    await insertEvent(first);
+    await insertEvent(second);
+    const concurrent = await Promise.all([publisher({ batchSize: 1 }).runOnce(), publisher({ batchSize: 1 }).runOnce()]);
+    expect(concurrent.reduce((sum, value) => sum + value.published, 0)).toBe(2);
+    const sent = await receive(10);
+    expect(sent.Messages?.length).toBe(2);
+    for (const message of sent.Messages ?? []) {
+      await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle! }));
+    }
+
+    await orm.em.getConnection().execute('delete from outbox_messages');
+    const contested = event(firstWallet.id);
+    await insertEvent(contested);
+    const stalePublisher = publisher({ publisherId: 'stale-worker', leaseMs: 1_000 });
+    process.env.WAGER_OUTBOX_TEST_ENABLE_FAULTS = 'true';
+    process.env.WAGER_OUTBOX_TEST_PAUSE_AFTER_SEND_MS = '1500';
+    const staleRun = stalePublisher.runOnce();
+    try {
+      let visible = false;
+      for (let attempt = 0; attempt < 30 && !visible; attempt += 1) {
+        const [attributes] = await sqs.send(new GetQueueAttributesCommand({ QueueUrl: queueUrl,
+          AttributeNames: ['ApproximateNumberOfMessages'] })).then((result) => [result.Attributes]);
+        visible = attributes?.ApproximateNumberOfMessages === '1';
+        if (!visible) await Bun.sleep(50);
+      }
+      expect(visible).toBe(true);
+      expect(await publisher({ publisherId: 'still-leased' }).runOnce())
+        .toEqual({ claimed: 0, published: 0, deferred: 0, staleClaims: 0 });
+      delete process.env.WAGER_OUTBOX_TEST_ENABLE_FAULTS;
+      delete process.env.WAGER_OUTBOX_TEST_PAUSE_AFTER_SEND_MS;
+      await Bun.sleep(1_050);
+      expect(await publisher({ publisherId: 'new-owner', leaseMs: 1_000 }).runOnce())
+        .toEqual({ claimed: 1, published: 1, deferred: 0, staleClaims: 0 });
+      expect(await staleRun).toEqual({ claimed: 1, published: 0, deferred: 0, staleClaims: 1 });
+    } finally {
+      delete process.env.WAGER_OUTBOX_TEST_PAUSE_AFTER_SEND_MS;
+      delete process.env.WAGER_OUTBOX_TEST_ENABLE_FAULTS;
+    }
+    const [row] = await orm.em.getConnection().execute<Array<{ published: boolean; claimedBy: string | null }>>(
+      `select published_at is not null as published, claimed_by as "claimedBy" from outbox_messages where id = ?`, [contested.eventId]);
+    expect(row).toEqual({ published: true, claimedBy: null });
+  }, 10_000);
+
+  test('a downstream consumer deduplicates a redelivered event by persistent eventId', async () => {
+    const wallet = await wallets.open({ playerId: id(), initialBalance: { amount: '0.00', currency: 'BRL' } });
+    const envelope = event(wallet.id);
+    await insertEvent(envelope);
+    expect((await publisher().runOnce()).published).toBe(1);
+    const delivery = (await receive(1)).Messages?.[0]!;
+    const parsed = JSON.parse(delivery.Body!) as typeof envelope;
+    await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: delivery.ReceiptHandle! }));
+    const applyOnce = async (eventId: string) => orm.em.transactional(async (em) => {
+      const [receipt] = await em.execute<Array<{ eventId: string }>>(
+        `insert into outbox_test_receipts(event_id) values (?) on conflict do nothing returning event_id as "eventId"`, [eventId]);
+      if (!receipt) return false;
+      await em.execute(`insert into outbox_test_effects(event_id, effect_count) values (?, 1)`, [eventId]);
+      return true;
+    });
+    expect(await applyOnce(parsed.eventId)).toBe(true);
+    await sqs.send(new SendMessageCommand({ QueueUrl: queueUrl, MessageBody: JSON.stringify(parsed),
+      MessageGroupId: parsed.aggregateId, MessageDeduplicationId: `${parsed.eventId}-redelivery` }));
+    const redelivery = (await receive(1)).Messages?.[0]!;
+    expect(await applyOnce((JSON.parse(redelivery.Body!) as typeof envelope).eventId)).toBe(false);
+    const [counts] = await orm.em.getConnection().execute<Array<{ receipts: string; effects: string }>>(
+      `select (select count(*) from outbox_test_receipts where event_id = ?)::text as receipts,
+        (select count(*) from outbox_test_effects where event_id = ?)::text as effects`, [parsed.eventId, parsed.eventId]);
+    expect(counts).toEqual({ receipts: '1', effects: '1' });
+  });
+
+  test('recovers separate publisher process crashes before send and after send before publishedAt', async () => {
+    const wallet = await wallets.open({ playerId: id(), initialBalance: { amount: '0.00', currency: 'BRL' } });
+    const beforeSendEvent = event(wallet.id);
+    let afterSendEvent = event(wallet.id);
+    await insertEvent(beforeSendEvent);
+    const baseEnv = {
+      ...process.env,
+      DATABASE_URL: process.env.DATABASE_URL!,
+      SQS_ENDPOINT: endpoint,
+      SQS_EVENTS_QUEUE_URL: queueUrl,
+      AWS_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'test',
+      AWS_SECRET_ACCESS_KEY: 'test',
+      OUTBOX_PUBLISHER_ID: 'crash-recovery-test',
+      OUTBOX_BATCH_SIZE: '1',
+      OUTBOX_LEASE_MS: '1000',
+      OUTBOX_POLL_INTERVAL_MS: '100',
+    };
+    const startProcess = (pause: 'claim' | 'send') => Bun.spawn(['bun', 'run', 'dist/src/messaging/outbox-publisher.main.js'], {
+      cwd: process.cwd(),
+      env: { ...baseEnv, WAGER_OUTBOX_TEST_ENABLE_FAULTS: 'true',
+        ...(pause === 'claim' ? { WAGER_OUTBOX_TEST_PAUSE_AFTER_CLAIM_MS: '30000' }
+          : { WAGER_OUTBOX_TEST_PAUSE_AFTER_SEND_MS: '30000' }) },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    const waitFor = async (predicate: () => Promise<boolean>, timeoutMs = 10_000) => {
+      const started = Date.now();
+      while (Date.now() - started < timeoutMs) {
+        if (await predicate()) return true;
+        await Bun.sleep(50);
+      }
+      return false;
+    };
+    const beforeCrash = startProcess('claim');
+    try {
+      expect(await waitFor(async () => {
+        const [row] = await orm.em.getConnection().execute<Array<{ claimed: boolean }>>(
+          `select claimed_by is not null as claimed from outbox_messages where id = ?`, [beforeSendEvent.eventId]);
+        return row?.claimed === true;
+      })).toBe(true);
+      beforeCrash.kill('SIGKILL');
+      await beforeCrash.exited;
+      const [beforeState] = await orm.em.getConnection().execute<Array<{ published: boolean }>>(
+        `select published_at is not null as published from outbox_messages where id = ?`, [beforeSendEvent.eventId]);
+      expect(beforeState?.published).toBe(false);
+      const [emptyQueue] = await sqs.send(new GetQueueAttributesCommand({ QueueUrl: queueUrl,
+        AttributeNames: ['ApproximateNumberOfMessages'] })).then((result) => [result.Attributes]);
+      expect(emptyQueue?.ApproximateNumberOfMessages).toBe('0');
+      await Bun.sleep(1_100);
+    } finally {
+      if (beforeCrash.exitCode === null) beforeCrash.kill('SIGKILL');
+    }
+
+    const recoverBefore = Bun.spawn(['bun', 'run', 'dist/src/messaging/outbox-publisher.main.js'], {
+      cwd: process.cwd(), env: { ...baseEnv, OUTBOX_PUBLISHER_ID: 'recover-before-send', WAGER_OUTBOX_TEST_ENABLE_FAULTS: 'false' },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    try {
+      expect(await waitFor(async () => {
+        const [row] = await orm.em.getConnection().execute<Array<{ published: boolean }>>(
+          `select published_at is not null as published from outbox_messages where id = ?`, [beforeSendEvent.eventId]);
+        return row?.published === true;
+      })).toBe(true);
+    } finally {
+      if (recoverBefore.exitCode === null) recoverBefore.kill('SIGTERM');
+      await recoverBefore.exited;
+    }
+
+    afterSendEvent = event(wallet.id);
+    await insertEvent(afterSendEvent);
+    const afterCrash = startProcess('send');
+    try {
+      expect(await waitFor(async () => {
+        const [attributes] = await sqs.send(new GetQueueAttributesCommand({ QueueUrl: queueUrl,
+          AttributeNames: ['ApproximateNumberOfMessages'] })).then((result) => [result.Attributes]);
+        return attributes?.ApproximateNumberOfMessages === '2';
+      })).toBe(true);
+      const [pendingState] = await orm.em.getConnection().execute<Array<{ published: boolean }>>(
+        `select published_at is not null as published from outbox_messages where id = ?`, [afterSendEvent.eventId]);
+      expect(pendingState?.published).toBe(false);
+      afterCrash.kill('SIGKILL');
+      await afterCrash.exited;
+      await Bun.sleep(1_100);
+    } finally {
+      if (afterCrash.exitCode === null) afterCrash.kill('SIGKILL');
+    }
+
+    const recoverAfter = Bun.spawn(['bun', 'run', 'dist/src/messaging/outbox-publisher.main.js'], {
+      cwd: process.cwd(), env: { ...baseEnv, OUTBOX_PUBLISHER_ID: 'recover-after-send', WAGER_OUTBOX_TEST_ENABLE_FAULTS: 'false' },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    try {
+      expect(await waitFor(async () => {
+        const [row] = await orm.em.getConnection().execute<Array<{ published: boolean }>>(
+          `select published_at is not null as published from outbox_messages where id = ?`, [afterSendEvent.eventId]);
+        return row?.published === true;
+      })).toBe(true);
+    } finally {
+      if (recoverAfter.exitCode === null) recoverAfter.kill('SIGTERM');
+      await recoverAfter.exited;
+    }
+
+    const gracefulEvent = event(wallet.id);
+    await insertEvent(gracefulEvent);
+    const gracefulPublisher = Bun.spawn(['bun', 'run', 'dist/src/messaging/outbox-publisher.main.js'], {
+      cwd: process.cwd(),
+      env: { ...baseEnv, OUTBOX_PUBLISHER_ID: 'graceful-shutdown-test', OUTBOX_LEASE_MS: '5000',
+        WAGER_OUTBOX_TEST_ENABLE_FAULTS: 'true', WAGER_OUTBOX_TEST_PAUSE_AFTER_SEND_MS: '1500' },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    try {
+      expect(await waitFor(async () => {
+        const [attributes] = await sqs.send(new GetQueueAttributesCommand({ QueueUrl: queueUrl,
+          AttributeNames: ['ApproximateNumberOfMessages'] })).then((result) => [result.Attributes]);
+        return attributes?.ApproximateNumberOfMessages === '3';
+      })).toBe(true);
+      gracefulPublisher.kill('SIGTERM');
+      await gracefulPublisher.exited;
+      const gracefulOutput = await new Response(gracefulPublisher.stdout).text()
+        + await new Response(gracefulPublisher.stderr).text();
+      expect(gracefulOutput).toContain('outbox_shutdown_complete');
+      const [state] = await orm.em.getConnection().execute<Array<{ published: boolean }>>(
+        `select published_at is not null as published from outbox_messages where id = ?`, [gracefulEvent.eventId]);
+      expect(state?.published).toBe(true);
+    } finally {
+      if (gracefulPublisher.exitCode === null) gracefulPublisher.kill('SIGKILL');
+      await gracefulPublisher.exited;
+    }
+    const messages = (await receive(10)).Messages ?? [];
+    expect(messages.map((message) => (JSON.parse(message.Body!) as { eventId: string }).eventId)
+      .filter((eventId) => [beforeSendEvent.eventId, afterSendEvent.eventId, gracefulEvent.eventId].includes(eventId)).sort())
+      .toEqual([beforeSendEvent.eventId, afterSendEvent.eventId, gracefulEvent.eventId].sort());
+  }, 30_000);
 });

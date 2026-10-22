@@ -74,6 +74,7 @@ export class OutboxMessageRecord {
   nextAttemptAt?: Date;
   claimedBy?: string;
   lockedUntil?: Date;
+  lastError?: string;
 }
 
 const uuid = { type: 'uuid' as const };
@@ -147,6 +148,7 @@ export const OutboxMessageSchema = new EntitySchema<OutboxMessageRecord>({
     publishedAt: { ...timestamp, fieldName: 'published_at', nullable: true }, attempts: { type: 'integer' },
     nextAttemptAt: { ...timestamp, fieldName: 'next_attempt_at', nullable: true }, claimedBy: { ...text, fieldName: 'claimed_by', nullable: true },
     lockedUntil: { ...timestamp, fieldName: 'locked_until', nullable: true },
+    lastError: { ...text, fieldName: 'last_error', nullable: true },
   },
 });
 
