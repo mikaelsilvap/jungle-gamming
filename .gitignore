@@ -1,0 +1,36 @@
+# Environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+.bun/
+bun.lockb
+
+# Local state
+.data/
+tmp/
+temp/
+*.log
+
+# Internal execution material (never publish with the evaluation repository)
+AGENTS.md
+RTK.md
+implementationPlan.md
+PLANO_IMPLEMENTACAO_JUNGLE_CODEX.md
+prompts.md
+prompts_*.md
+.phase0-audit.md
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
