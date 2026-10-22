@@ -67,7 +67,7 @@ Status: implementation complete for HTTP and PostgreSQL transaction scope; multi
 - Processed, rejected, pending-reference, and balance-changed envelopes are stored in outbox in the same commit as financial state. LOSS and rejection do not write `WalletBalanceChanged`. Positive wallet opening was minimally extended to store processed and balance-changed events atomically.
 - Integration coverage includes 50 concurrent duplicate submissions, concurrent 80.00 BRL bets against 100.00 BRL, original-balance replay after a later change, divergent-payload conflict, pending reference, reversal semantics, LOSS/rejection effects, opening events, and rollback after a forced ledger failure.
 - Three-independent-process concurrency is NOT_RUN; this phase has no evidence for that guarantee.
-- Final verification on 2026-10-22: `bun test` PASS (53 tests / 221 expectations; 34 domain unit tests and 19 PostgreSQL integration tests), `bun run typecheck` PASS, `bun run build` PASS, and `git diff --check` PASS. The full migration chain completed up → down → up in the disposable integration database.
+- Final verification on 2026-10-22: `bun test` PASS (53 tests / 223 expectations; 34 domain unit tests and 19 PostgreSQL integration tests), `bun run typecheck` PASS, `bun run build` PASS, and `git diff --check` PASS. The full migration chain completed up → down → up in the disposable integration database.
 - HTTP Compose smoke PASS: opened a wallet, issued 50 concurrent identical `POST /wagering/transactions` calls (one non-replay financial effect), then queried by transaction ID and provider/external ID successfully.
 
 ## Later phases
