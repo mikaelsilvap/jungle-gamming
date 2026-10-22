@@ -554,6 +554,24 @@ GET /health/ready    # PostgreSQL e SQS alcançáveis
 
 Os endpoints de health **não** devem exigir autenticação.
 
+`/health/live` reports only whether the HTTP process can answer. `/health/ready` runs bounded PostgreSQL `SELECT 1` and SQS `GetQueueAttributes` probes; it returns HTTP 503 with a generic body when either dependency is unavailable. Readiness is re-evaluated on every request so it recovers without a restart. Docker Compose health checks use liveness for the API and its internal process diagnostics endpoint for each worker.
+
+### Logs and metrics
+
+Application logs are one JSON object per line with `timestamp`, `level`, `service`, and a stable `event`. The API accepts `X-Correlation-Id` (validated and returned in the response); if omitted, it creates the request correlation ID at ingress. SQS uses the existing envelope `messageId` as its correlation ID. The same correlation ID is carried into transactional outbox events, while `eventId` and transaction IDs remain unchanged. Log fields are allow-listed: request bodies, money values, credentials, authentication headers, and raw exception messages are excluded.
+
+Example (sanitized):
+
+```json
+{"timestamp":"2026-10-22T12:00:00.000Z","level":"info","service":"wagering","event":"wager_processing_completed","correlationId":"request-123","transactionId":"transaction-456","walletId":"wallet-789","providerId":"provider-a","status":"PROCESSED","kind":"BET","durationMs":8.4}
+```
+
+Metrics use Prometheus text exposition at `GET /metrics`. The API binds to `127.0.0.1:3000` in the local Compose configuration; do not publish this endpoint on a public interface. It reports API and shared wager-process counters plus current database outbox and SQS DLQ gauges. Each independent worker has its own registry and internal-only diagnostic endpoint on the Compose network: SQS consumer `:9101`, pending-reference worker `:9102`, and outbox publisher `:9103`. Query a specific process with `docker compose exec <service> bun -e "fetch('http://127.0.0.1:<port>/metrics').then(r=>r.text()).then(console.log)"`. Scaled replicas have separate registries; query each container individually and do not sum them without accounting for scrape windows and process restarts.
+
+Metrics include transactions by persisted outcome and operation kind, idempotency and Inbox duplicates, idempotency conflicts, PostgreSQL serialization/deadlock retries, pending-reference retries, SQS visibility retries and redrive-threshold events, approximate DLQ depth, outbox pending count and oldest-event lag, outbox publication success/failure and retry counters, and financial, worker, HTTP, and outbox publication latency histograms. Labels are limited to bounded outcome/status/kind values; business identifiers remain in logs. DLQ depth comes from SQS's approximate visible and in-flight counts. The redrive counter records deliveries reaching the configured `maxReceiveCount` and left unacknowledged; the broker performs the actual move under its RedrivePolicy, so this event counter is an operational trigger signal rather than a broker-confirmed transfer audit.
+
+Registries are in memory and scoped to one process. Counters and histogram samples reset when that process restarts. Gauges are sampled from live PostgreSQL/SQS state when `/metrics` is read and are approximate where SQS documents approximate attributes. No metrics call increments business-event counters.
+
 ---
 
 ## 10. Processamento por SQS

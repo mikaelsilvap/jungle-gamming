@@ -118,6 +118,20 @@ Status: implementation and local verification complete.
 - Two built Compose publisher containers were active concurrently. Together they published the 50 pre-existing local outbox events to `wager-events.fifo`; the default database showed `0` pending / `50` published. Both containers logged `outbox_shutdown_complete` after SIGTERM.
 - Final `bun run typecheck`, `bun run build`, `docker compose config --quiet`, `docker compose build outbox-publisher`, and `git diff --check`: PASS. No push or remote change was performed.
 
+## Phase 7 — Observability and health checks
+
+Status: implementation and local verification complete for process-local observability, health endpoints, and worker diagnostics.
+
+- Added structured JSON logs with async correlation context across HTTP, wager processing, SQS consumption, pending-reference recovery, and outbox publishing. Log fields are allowlisted; request payloads, financial amounts, credentials, headers, and raw exception messages are excluded.
+- Added process-local Prometheus counters, gauges, and histograms for HTTP and financial operations, retries, lock conflicts, pending-reference recovery, SQS receive/retry/DLQ signals, and outbox publication/retry/age. `GET /metrics` exposes API metrics; each standalone worker has private Compose-only diagnostics on its own port.
+- Added `/health/live` and dependency-checked `/health/ready` to the API. Worker diagnostics expose liveness/readiness; readiness probes PostgreSQL and SQS. Compose health checks use process liveness for workers and HTTP health routes for the API.
+- Readiness samples the actual outbox pending count/age and approximate SQS DLQ depth. The DLQ forwarding counter is a consumer-side receive-limit signal, not a broker-confirmed redrive audit. Metrics are per-process and are not aggregated across replicas.
+- Added unit coverage for JSON safety, correlation propagation, metric exposition, and real PostgreSQL + LocalStack HTTP integration coverage for health status, recovery, metrics, wager correlation, and outbox propagation.
+- Final `bun run typecheck` and `bun run build`: PASS. Full `bun test` against the disposable PostgreSQL database and LocalStack 4.12.0: PASS, 86 tests / 435 expectations. This includes observability tests and prior domain, persistence, wagering, recovery, consumer, and publisher suites. An initial sandboxed run could not reach the local database; the approved rerun with Docker-backed access passed.
+- `docker compose config --quiet` and `git diff --check`: PASS. `docker compose up -d --build` rebuilt and started the API, SQS consumer, pending-reference worker, and outbox publisher. Compose reported all app services, PostgreSQL, and LocalStack healthy.
+- Runtime smoke PASS: API `/health/live`, `/health/ready`, and `/metrics` returned HTTP 200; each worker's private `/health/live`, `/health/ready`, and `/metrics` endpoint returned HTTP 200. API readiness reported PostgreSQL and SQS up, zero pending outbox rows, zero lag, and zero DLQ messages.
+- Dashboards, centralized metrics aggregation, alerting, and cross-replica metric aggregation remain outside this phase.
+
 ## Later phases
 
-Not started. See `implementationPlan.md` in the local workspace; it is intentionally excluded from the evaluation repository.
+Phase 8 and later: not started. See `implementationPlan.md` in the local workspace; it is intentionally excluded from the evaluation repository.

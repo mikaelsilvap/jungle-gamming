@@ -46,6 +46,18 @@ Inspect messaging process logs with:
 docker compose logs -f sqs-consumer outbox-publisher pending-reference-worker
 ```
 
+The API endpoints `GET /health/live` and `GET /health/ready` bind through the local-only API port. Liveness is process-only; readiness runs a bounded PostgreSQL query and an SQS queue-attributes operation. Query API metrics locally with `curl http://127.0.0.1:3000/metrics`.
+
+Each worker keeps a separate in-memory metrics registry and exposes `/metrics`, `/health/live`, and `/health/ready` on its private Compose network port: `9101` for `sqs-consumer`, `9102` for `pending-reference-worker`, and `9103` for `outbox-publisher`. These ports are not published to the host. Inspect one process without merging replica counters:
+
+```bash
+docker compose exec sqs-consumer bun -e "fetch('http://127.0.0.1:9101/metrics').then(r => r.text()).then(console.log)"
+docker compose exec pending-reference-worker bun -e "fetch('http://127.0.0.1:9102/metrics').then(r => r.text()).then(console.log)"
+docker compose exec outbox-publisher bun -e "fetch('http://127.0.0.1:9103/metrics').then(r => r.text()).then(console.log)"
+```
+
+Metrics counters and histogram observations reset when a process restarts. Outbox and DLQ depth metrics are scraped from their live dependencies and are gauges; SQS queue depth is approximate. The consumer redrive counter records deliveries reaching the configured receive limit and left unacknowledged for the native queue policy, not a broker-side transfer receipt.
+
 To check that an outbox event is flowing locally, submit a wallet or wager operation after applying migrations, then inspect the publisher logs and receive from `wager-events.fifo` with the LocalStack AWS CLI. The publisher sends only events already committed to PostgreSQL. Duplicate event delivery is expected after a publisher crash between SQS confirmation and the `published_at` update; downstream consumers must persistently deduplicate using `eventId`.
 
 ## Apply PostgreSQL migrations
