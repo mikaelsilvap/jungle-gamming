@@ -14,6 +14,7 @@ import {
 import { WalletOpeningService } from '../../src/wallets/wallet-opening.service';
 import { ProcessWagerInput, ProcessWagerService } from '../../src/wagering/process-wager.service';
 import { PendingReferenceWorker } from '../../src/wagering/pending-reference.worker';
+import { ReferenceRetryPolicy } from '../../src/wagering/reference-retry-policy';
 
 const testDatabaseName = process.env.TEST_DATABASE_NAME ?? 'wagering_phase2_test';
 let orm: Awaited<ReturnType<typeof createOrm>>;
@@ -578,5 +579,30 @@ describe('PostgreSQL pending-reference worker phase 4', () => {
     const [row] = await orm.em.getConnection().execute<Array<{ attempts: number }>>(
       `select pending_attempts as attempts from wager_transactions where id = ?`, [pending.result.transactionId]);
     expect(row?.attempts).toBe(1);
+  });
+
+  test('rejects a pending reference with a stable code after the configured attempt limit', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const pending = await pendingOperation(WagerTransactionKind.Refund, playerId, wallet.id, 'attempt-limit-bet', `p-${id()}`);
+    await orm.em.getConnection().execute(
+      `update wager_transactions set next_attempt_at = now() - interval '1 second', reference_expires_at = now() + interval '1 hour' where id = ?`,
+      [pending.result.transactionId]);
+    const processor = new ProcessWagerService(orm, new ReferenceRetryPolicy({
+      baseDelayMs: 1, maximumDelayMs: 10, timeToLiveMs: 3_600_000, maximumAttempts: 1,
+    }));
+    const worker = new PendingReferenceWorker(processor, () => new Date());
+    expect((await worker.runOnce()).rejected).toBe(1);
+    const result = await wagers.getById(pending.result.transactionId);
+    expect(result?.status).toBe(WagerTransactionStatus.Rejected);
+    expect(result?.failureCode).toBe(FailureCode.ReferenceRetryExhausted);
+    const [counts] = await orm.em.getConnection().execute<Array<{ attempts: number; pendingEvents: string; rejectedEvents: string; ledger: string }>>(
+      `select pending_attempts as attempts,
+        (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionPendingReference')::text as "pendingEvents",
+        (select count(*) from outbox_messages where payload->'data'->>'transactionId' = ? and event_type = 'WagerTransactionRejected')::text as "rejectedEvents",
+        (select count(*) from wallet_ledger_entries where transaction_id = ?)::text as ledger
+       from wager_transactions where id = ?`,
+      [pending.result.transactionId, pending.result.transactionId, pending.result.transactionId, pending.result.transactionId]);
+    expect(counts).toEqual({ attempts: 1, pendingEvents: '1', rejectedEvents: '1', ledger: '0' });
   });
 });
