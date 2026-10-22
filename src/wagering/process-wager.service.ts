@@ -6,6 +6,7 @@ import {
   WagerTransactionRejected, WagerTransactionStatus, Wallet, WalletBalanceChanged,
 } from '../domain';
 import { OutboxMessage } from '../domain/outbox-message';
+import { InboxMessage } from '../domain/inbox-message';
 import { rehydrateWallet, rehydrateWagerTransaction } from '../persistence/rehydration';
 import { WagerTransactionRecord, WalletRecord } from '../persistence/entities';
 import { ReferenceRetryPolicy } from './reference-retry-policy';
@@ -19,8 +20,11 @@ export interface WagerResult {
   transactionId: string; status: WagerTransactionStatus; balance: { amount: string; currency: string };
   idempotentReplay: boolean; failureCode?: FailureCode;
 }
+export interface WagerInboxContext { consumerName: string; messageId: string; payloadHash: string }
+export type InboxWagerResult = { duplicate: true } | { duplicate: false; result: WagerResult };
 export class IdempotencyConflictError extends Error { readonly code = 'IDEMPOTENCY_CONFLICT'; }
 export class ExternalTransactionConflictError extends Error { readonly code = 'EXTERNAL_TRANSACTION_CONFLICT'; }
+export class InboxMessageConflictError extends Error { readonly code = 'INBOX_MESSAGE_CONFLICT'; }
 export class WagerNotFoundError extends Error { readonly code = 'WAGER_NOT_FOUND'; }
 export class WalletNotFoundError extends Error { readonly code = 'WALLET_NOT_FOUND'; }
 export class TransientWagerPersistenceError extends Error {
@@ -80,14 +84,24 @@ export class ProcessWagerService {
   ) {}
 
   async process(input: ProcessWagerInput, idempotencyKey: string): Promise<WagerResult> {
+    return await this.execute(input, idempotencyKey) as WagerResult;
+  }
+
+  async processFromInbox(input: ProcessWagerInput, idempotencyKey: string, inbox: WagerInboxContext): Promise<InboxWagerResult> {
+    return await this.execute(input, idempotencyKey, inbox) as InboxWagerResult;
+  }
+
+  private async execute(input: ProcessWagerInput, idempotencyKey: string, inbox?: WagerInboxContext): Promise<WagerResult | InboxWagerResult> {
     const payloadHash = hashPayload(input);
     if (input.money.amount.split('.')[0]!.replace(/^0+/, '').length > 36) {
       throw new DomainError(FailureCode.InvalidMoney, 'Amount exceeds PostgreSQL NUMERIC(38,2) capacity.');
     }
     for (let attempt = 0; ; attempt += 1) {
-      try { return await this.processOnce(input, idempotencyKey, payloadHash); }
+      try { return await this.processOnce(input, idempotencyKey, payloadHash, inbox); }
       catch (error) {
         if (postgresCode(error) === '23505') {
+          if (inbox && attempt < 2) continue;
+          if (inbox) throw new InboxMessageConflictError('The message conflicts with an already persisted business operation.');
           const [sameKey] = await this.orm.em.getConnection().execute<WagerTransactionRecord[]>(
             `select ${wagerColumns} from wager_transactions where provider_id = ? and idempotency_key = ?`, [input.providerId, idempotencyKey]);
           if (sameKey) {
@@ -104,9 +118,39 @@ export class ProcessWagerService {
     }
   }
 
-  private async processOnce(input: ProcessWagerInput, idempotencyKey: string, payloadHash: string): Promise<WagerResult> {
+  private async processOnce(input: ProcessWagerInput, idempotencyKey: string, payloadHash: string,
+    inbox?: WagerInboxContext): Promise<WagerResult | InboxWagerResult> {
     const now = this.clock();
     return this.orm.em.transactional(async (em) => {
+      let inboxMessage: InboxMessage | undefined;
+      if (inbox) {
+        const [storedInbox] = await em.execute<Array<{ payloadHash: string; receivedAt: Date | string; processedAt?: Date | string }>>(
+          `select payload_hash as "payloadHash", received_at as "receivedAt", processed_at as "processedAt"
+           from inbox_messages where consumer_name = ? and message_id = ? for update`,
+          [inbox.consumerName, inbox.messageId]);
+        if (storedInbox) {
+          if (storedInbox.payloadHash.trim() !== inbox.payloadHash) {
+            throw new InboxMessageConflictError('A message id was reused with a different payload.');
+          }
+          if (storedInbox.processedAt) return { duplicate: true };
+          inboxMessage = InboxMessage.rehydrate({
+            consumerName: inbox.consumerName, messageId: inbox.messageId, payloadHash: inbox.payloadHash,
+            receivedAt: storedInbox.receivedAt instanceof Date ? storedInbox.receivedAt : new Date(storedInbox.receivedAt),
+          });
+        } else {
+          inboxMessage = InboxMessage.receive({ consumerName: inbox.consumerName, messageId: inbox.messageId,
+            payloadHash: inbox.payloadHash, receivedAt: now });
+          await em.execute(`insert into inbox_messages (consumer_name, message_id, payload_hash, received_at, processed_at)
+            values (?, ?, ?, ?, null)`, [inbox.consumerName, inbox.messageId, inbox.payloadHash, inboxMessage.receivedAt]);
+        }
+      }
+      const finish = async (result: WagerResult): Promise<WagerResult | InboxWagerResult> => {
+        if (!inbox || !inboxMessage) return result;
+        inboxMessage.markProcessed(now);
+        await em.execute(`update inbox_messages set processed_at = ? where consumer_name = ? and message_id = ? and processed_at is null`,
+          [inboxMessage.processedAt, inbox.consumerName, inbox.messageId]);
+        return { duplicate: false, result };
+      };
       const [walletRow] = await em.execute<WalletRecord[]>(
         `select id, player_id as "playerId", currency, balance_amount::text as "balanceAmount", version,
           created_at as "createdAt", updated_at as "updatedAt" from wallets where id = ? for update`, [input.walletId]);
@@ -117,7 +161,7 @@ export class ProcessWagerService {
         `select ${wagerColumns} from wager_transactions where provider_id = ? and idempotency_key = ?`, [input.providerId, idempotencyKey]);
       if (existing) {
         if (existing.payloadHash.trim() !== payloadHash) throw new IdempotencyConflictError('Idempotency key was already used with a different payload.');
-        return resultFrom(existing, true, true);
+        return await finish(resultFrom(existing, true, true));
       }
 
       const parsedMoney = Money.from(input.money);
@@ -190,7 +234,7 @@ export class ProcessWagerService {
           if (transaction.status === WagerTransactionStatus.PendingReference) {
             await this.enqueue(em, WagerTransactionPendingReference.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
           }
-          return { transactionId: id, status: transaction.status, balance: response, idempotentReplay: false };
+          return await finish({ transactionId: id, status: transaction.status, balance: response, idempotentReplay: false });
         }
       } catch (error) {
         if (!(error instanceof DomainError)) throw error;
@@ -212,8 +256,8 @@ export class ProcessWagerService {
       if (transaction.status === WagerTransactionStatus.PendingReference) {
         await this.enqueue(em, WagerTransactionPendingReference.from(transaction, { eventId: randomUUID(), correlationId: id, causationId: id, occurredAt: now }));
       }
-      return { transactionId: id, status: transaction.status, balance: response, idempotentReplay: false,
-        ...(transaction.failureCode ? { failureCode: transaction.failureCode } : {}) };
+      return await finish({ transactionId: id, status: transaction.status, balance: response, idempotentReplay: false,
+        ...(transaction.failureCode ? { failureCode: transaction.failureCode } : {}) });
     });
   }
 

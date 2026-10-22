@@ -65,5 +65,25 @@ services:
       postgres:
         condition: service_healthy
 
+  sqs-consumer:
+    build: .
+    command: ["bun", "run", "dist/src/messaging/wager-sqs-consumer.main.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wagering_app}:${POSTGRES_PASSWORD:-local_only_change_me}@postgres:5432/${POSTGRES_DB:-wagering}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      SQS_ENDPOINT: http://localstack:4566
+      SQS_COMMAND_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_VISIBILITY_TIMEOUT_SECONDS: 60
+      SQS_CONSUMER_NAME: distributed-wagering-processor-v1
+    stop_grace_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+
 volumes:
   postgres_data:

@@ -1,5 +1,9 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
+import {
+  CreateQueueCommand, DeleteQueueCommand, GetQueueAttributesCommand, ReceiveMessageCommand,
+  SendMessageCommand, SQSClient,
+} from '@aws-sdk/client-sqs';
 import { FailureCode, Money, WagerTransactionKind, WagerTransactionStatus } from '../../src/domain';
 import { InboxMessageRecord, OutboxMessageRecord, WalletLedgerEntryRecord, WalletRecord, WagerTransactionRecord } from '../../src/persistence/entities';
 import { createOrm } from '../../src/persistence/orm';
@@ -15,6 +19,7 @@ import { WalletOpeningService } from '../../src/wallets/wallet-opening.service';
 import { ProcessWagerInput, ProcessWagerService } from '../../src/wagering/process-wager.service';
 import { PendingReferenceWorker } from '../../src/wagering/pending-reference.worker';
 import { ReferenceRetryPolicy } from '../../src/wagering/reference-retry-policy';
+import { WagerSqsConsumer, createWagerSqsClient } from '../../src/messaging/wager-sqs-consumer';
 
 const testDatabaseName = process.env.TEST_DATABASE_NAME ?? 'wagering_phase2_test';
 let orm: Awaited<ReturnType<typeof createOrm>>;
@@ -609,4 +614,321 @@ describe('PostgreSQL pending-reference worker phase 4', () => {
       [pending.result.transactionId, pending.result.transactionId, pending.result.transactionId, pending.result.transactionId]);
     expect(counts).toEqual({ attempts: 1, pendingEvents: '1', rejectedEvents: '1', ledger: '0' });
   });
+});
+
+describe('PostgreSQL and LocalStack SQS consumer phase 5', () => {
+  const endpoint = process.env.SQS_ENDPOINT ?? 'http://127.0.0.1:4566';
+  const sqs = new SQSClient({ endpoint, region: process.env.AWS_REGION ?? 'us-east-1',
+    credentials: { accessKeyId: 'test', secretAccessKey: 'test' } });
+  const consumerName = 'phase5-integration-consumer-v1';
+  let queueUrl = '';
+  let dlqUrl = '';
+
+  function request(walletId: string, playerId: string, overrides: Partial<ProcessWagerInput> = {}): ProcessWagerInput {
+    return {
+      providerId: `sqs-${playerId}`, externalTransactionId: id(), playerId, walletId,
+      roundId: 'phase5-round', gameId: 'phase5-game', kind: WagerTransactionKind.Bet,
+      money: { amount: '10.00', currency: 'BRL' }, ...overrides,
+    };
+  }
+
+  function envelope(input: ProcessWagerInput, messageId = id(), idempotencyKey = `sqs-key:${id()}`) {
+    return { messageId, type: 'WagerTransactionRequested', occurredAt: new Date().toISOString(),
+      data: { ...input, idempotencyKey } };
+  }
+
+  async function send(body: unknown, messageGroupId = 'invalid-or-unassigned-group'): Promise<void> {
+    await sqs.send(new SendMessageCommand({ QueueUrl: queueUrl, MessageBody: JSON.stringify(body),
+      MessageGroupId: messageGroupId, MessageDeduplicationId: id() }));
+  }
+
+  function consumer(waitTimeSeconds = 1, maxMessages = 10): WagerSqsConsumer {
+    return new WagerSqsConsumer(wagers, sqs, { queueUrl, consumerName, visibilityTimeoutSeconds: 2,
+      waitTimeSeconds, maxMessages, retryBaseSeconds: 1, retryMaximumSeconds: 2 });
+  }
+
+  async function rowFor(providerId: string, externalTransactionId: string): Promise<WagerTransactionRecord | undefined> {
+    const [row] = await orm.em.getConnection().execute<WagerTransactionRecord[]>(
+      `select ${'id, provider_id as "providerId", external_transaction_id as "externalTransactionId", status, failure_code as "failureCode"'}
+       from wager_transactions where provider_id = ? and external_transaction_id = ?`, [providerId, externalTransactionId]);
+    return row;
+  }
+
+  beforeEach(async () => {
+    if (queueUrl) await sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl }));
+    if (dlqUrl) await sqs.send(new DeleteQueueCommand({ QueueUrl: dlqUrl }));
+    const suffix = randomUUID().replaceAll('-', '');
+    const dlqName = `wager-test-dlq-${suffix}.fifo`;
+    const queueName = `wager-test-command-${suffix}.fifo`;
+    dlqUrl = (await sqs.send(new CreateQueueCommand({ QueueName: dlqName, Attributes: {
+      FifoQueue: 'true', ContentBasedDeduplication: 'false', VisibilityTimeout: '2',
+    } }))).QueueUrl!;
+    const [dlqAttributes] = await sqs.send(new GetQueueAttributesCommand({ QueueUrl: dlqUrl, AttributeNames: ['QueueArn'] }))
+      .then((result) => [result.Attributes]);
+    queueUrl = (await sqs.send(new CreateQueueCommand({ QueueName: queueName, Attributes: {
+      FifoQueue: 'true', ContentBasedDeduplication: 'false', VisibilityTimeout: '2',
+      RedrivePolicy: JSON.stringify({ deadLetterTargetArn: dlqAttributes!.QueueArn, maxReceiveCount: '3' }),
+    } }))).QueueUrl!;
+  });
+
+  afterAll(async () => {
+    if (queueUrl) await sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl }));
+    if (dlqUrl) await sqs.send(new DeleteQueueCommand({ QueueUrl: dlqUrl }));
+    sqs.destroy();
+  });
+
+  test('processes a real FIFO wager with atomic Inbox, ledger, and Outbox writes before ACK', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = request(wallet.id, playerId);
+    const message = envelope(input);
+    await send(message, wallet.id);
+    expect(await consumer().runOnce()).toEqual({ received: 1, acknowledged: 1, inboxDuplicates: 0, deferred: 0 });
+    const [inbox] = await orm.em.getConnection().execute<Array<{ processed_at: Date | null; payload_hash: string }>>(
+      `select processed_at, payload_hash from inbox_messages where consumer_name = ? and message_id = ?`,
+      [consumerName, message.messageId]);
+    const [counts] = await orm.em.getConnection().execute<Array<{ wagers: string; ledger: string; outbox: string }>>(
+      `select (select count(*) from wager_transactions where provider_id = ? and external_transaction_id = ?)::text as wagers,
+        (select count(*) from wallet_ledger_entries where wallet_id = ?)::text as ledger,
+        (select count(*) from outbox_messages where payload->'data'->>'transactionId' = (select id::text from wager_transactions where provider_id = ? and external_transaction_id = ?))::text as outbox`,
+      [input.providerId, input.externalTransactionId, wallet.id, input.providerId, input.externalTransactionId]);
+    expect(Number.isFinite(new Date(inbox!.processed_at!).getTime())).toBe(true);
+    expect(inbox?.payload_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(counts).toEqual({ wagers: '1', ledger: '2', outbox: '2' });
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('deduplicates a repeated messageId and a repeated financial operation with different messageIds', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = request(wallet.id, playerId);
+    const sameMessage = envelope(input);
+    await send(sameMessage, wallet.id);
+    await send(sameMessage, wallet.id);
+    const duplicateStats = await consumer().runOnce();
+    expect(duplicateStats).toEqual({ received: 2, acknowledged: 2, inboxDuplicates: 1, deferred: 0 });
+
+    const secondInput = request(wallet.id, playerId);
+    const first = envelope(secondInput, id(), 'same-business-operation');
+    const second = envelope(secondInput, id(), 'same-business-operation');
+    await send(first, wallet.id);
+    await send(second, wallet.id);
+    expect(await consumer().runOnce()).toEqual({ received: 2, acknowledged: 2, inboxDuplicates: 0, deferred: 0 });
+    const [counts] = await orm.em.getConnection().execute<Array<{ inbox: string; wagers: string; ledger: string }>>(
+      `select (select count(*) from inbox_messages where consumer_name = ? and message_id in (?, ?, ?, ?))::text as inbox,
+        (select count(*) from wager_transactions where provider_id = ? and external_transaction_id = ?)::text as wagers,
+        (select count(*) from wallet_ledger_entries where wallet_id = ?)::text as ledger`,
+      [consumerName, sameMessage.messageId, first.messageId, second.messageId,
+        'message-not-present', secondInput.providerId, secondInput.externalTransactionId, wallet.id]);
+    expect(counts).toEqual({ inbox: '3', wagers: '1', ledger: '3' });
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('does not ACK a reused messageId with a divergent payload', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = request(wallet.id, playerId);
+    const original = envelope(input);
+    await send(original, wallet.id);
+    expect((await consumer().runOnce()).acknowledged).toBe(1);
+    const divergent = { ...original, data: { ...original.data, money: { amount: '11.00', currency: 'BRL' } } };
+    await send(divergent, wallet.id);
+    expect(await consumer().runOnce()).toEqual({ received: 1, acknowledged: 0, inboxDuplicates: 0, deferred: 1 });
+    const [counts] = await orm.em.getConnection().execute<Array<{ inbox: string; ledger: string }>>(
+      `select (select count(*) from inbox_messages where consumer_name = ? and message_id = ?)::text as inbox,
+        (select count(*) from wallet_ledger_entries l join wager_transactions w on w.id = l.transaction_id
+          where l.wallet_id = ? and w.kind <> 'OPENING')::text as ledger`, [consumerName, original.messageId, wallet.id]);
+    expect(counts).toEqual({ inbox: '1', ledger: '1' });
+  });
+
+  test('ACKs a persisted insufficient-funds rejection without a ledger movement', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '5.00', currency: 'BRL' } });
+    const input = request(wallet.id, playerId, { money: { amount: '10.00', currency: 'BRL' } });
+    await send(envelope(input), wallet.id);
+    expect(await consumer().runOnce()).toEqual({ received: 1, acknowledged: 1, inboxDuplicates: 0, deferred: 0 });
+    const row = await rowFor(input.providerId, input.externalTransactionId);
+    expect(row?.status).toBe(WagerTransactionStatus.Rejected);
+    expect(row?.failureCode).toBe(FailureCode.InsufficientFunds);
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('serializes same-wallet command messages in one FIFO group without overdraft', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const first = request(wallet.id, playerId, { money: { amount: '80.00', currency: 'BRL' } });
+    const second = request(wallet.id, playerId, { money: { amount: '80.00', currency: 'BRL' } });
+    await send(envelope(first), wallet.id);
+    await send(envelope(second), wallet.id);
+    expect(await consumer().runOnce()).toEqual({ received: 2, acknowledged: 2, inboxDuplicates: 0, deferred: 0 });
+    const [rows] = await orm.em.getConnection().execute<Array<{ processed: string; rejected: string; balance: string; wagerLedger: string }>>(
+      `select (select count(*) from wager_transactions where wallet_id = ? and kind = 'BET' and status = 'PROCESSED')::text as processed,
+        (select count(*) from wager_transactions where wallet_id = ? and kind = 'BET' and status = 'REJECTED')::text as rejected,
+        (select balance_amount::text from wallets where id = ?) as balance,
+        (select count(*) from wallet_ledger_entries l join wager_transactions w on w.id = l.transaction_id where w.wallet_id = ? and w.kind = 'BET')::text as "wagerLedger"`,
+      [wallet.id, wallet.id, wallet.id, wallet.id]);
+    expect(rows).toEqual({ processed: '1', rejected: '1', balance: '20.00', wagerLedger: '1' });
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('allows separate wallet groups to advance independently across real FIFO messages', async () => {
+    const playerA = id();
+    const playerB = id();
+    const walletA = await wallets.open({ playerId: playerA, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const walletB = await wallets.open({ playerId: playerB, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    await send(envelope(request(walletA.id, playerA)), walletA.id);
+    await send(envelope(request(walletB.id, playerB)), walletB.id);
+    expect(await consumer().runOnce()).toEqual({ received: 2, acknowledged: 2, inboxDuplicates: 0, deferred: 0 });
+    expect((await wallets.get(walletA.id))?.balance.amount).toBe('90.00');
+    expect((await wallets.get(walletB.id))?.balance.amount).toBe('90.00');
+    expect((await wallets.reconcile(walletA.id))?.consistent).toBe(true);
+    expect((await wallets.reconcile(walletB.id))?.consistent).toBe(true);
+  });
+
+  test('allows two independent consumer instances to process separate FIFO groups', async () => {
+    const playerA = id();
+    const playerB = id();
+    const walletA = await wallets.open({ playerId: playerA, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const walletB = await wallets.open({ playerId: playerB, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    await send(envelope(request(walletA.id, playerA)), walletA.id);
+    await send(envelope(request(walletB.id, playerB)), walletB.id);
+    const workers = [consumer(), consumer()];
+    const results = await Promise.all(workers.map((worker) => worker.runOnce()));
+    expect(results.reduce((sum, result) => sum + result.acknowledged, 0)).toBe(2);
+    expect(results.reduce((sum, result) => sum + result.received, 0)).toBe(2);
+    expect((await wallets.get(walletA.id))?.balance.amount).toBe('90.00');
+    expect((await wallets.get(walletB.id))?.balance.amount).toBe('90.00');
+    expect((await wallets.reconcile(walletA.id))?.consistent).toBe(true);
+    expect((await wallets.reconcile(walletB.id))?.consistent).toBe(true);
+  });
+
+  test('drains an in-flight real SQS delivery when the consumer is stopped', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = request(wallet.id, playerId);
+    const message = envelope(input);
+    await send(message, wallet.id);
+    process.env.WAGER_TEST_ENABLE_FAULTS = 'true';
+    process.env.WAGER_TEST_PAUSE_AFTER_COMMIT_MS = '1200';
+    const worker = consumer(1, 1);
+    try {
+      worker.start();
+      let committedInbox = false;
+      for (let attempt = 0; attempt < 40 && !committedInbox; attempt += 1) {
+        const [row] = await orm.em.getConnection().execute<Array<{ processed: boolean }>>(
+          `select processed_at is not null as processed from inbox_messages where consumer_name = ? and message_id = ?`,
+          [consumerName, message.messageId]);
+        committedInbox = row?.processed === true;
+        if (!committedInbox) await Bun.sleep(50);
+      }
+      expect(committedInbox).toBe(true);
+      await worker.stop();
+    } finally {
+      delete process.env.WAGER_TEST_PAUSE_AFTER_COMMIT_MS;
+      delete process.env.WAGER_TEST_ENABLE_FAULTS;
+      await worker.stop();
+    }
+    const empty = await sqs.send(new ReceiveMessageCommand({ QueueUrl: queueUrl, MaxNumberOfMessages: 1,
+      WaitTimeSeconds: 1, VisibilityTimeout: 1 }));
+    expect(empty.Messages ?? []).toEqual([]);
+    expect((await wallets.get(wallet.id))?.balance.amount).toBe('90.00');
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('ACKs REFUND before its reference and resolves it later through the shared domain worker', async () => {
+    const playerId = id();
+    const providerId = `sqs-${playerId}`;
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const refund = request(wallet.id, playerId, { providerId, kind: WagerTransactionKind.Refund,
+      referenceExternalTransactionId: 'sqs-bet-arrives-later' });
+    const message = envelope(refund);
+    await send(message, wallet.id);
+    expect(await consumer().runOnce()).toEqual({ received: 1, acknowledged: 1, inboxDuplicates: 0, deferred: 0 });
+    expect((await rowFor(refund.providerId, refund.externalTransactionId))?.status).toBe(WagerTransactionStatus.PendingReference);
+    const bet = request(wallet.id, playerId, { providerId, externalTransactionId: 'sqs-bet-arrives-later',
+      roundId: refund.roundId, money: refund.money });
+    expect((await wagers.process(bet, `reference:${id()}`)).status).toBe(WagerTransactionStatus.Processed);
+    await orm.em.getConnection().execute(`update wager_transactions set next_attempt_at = now() - interval '1 second' where provider_id = ? and external_transaction_id = ?`,
+      [refund.providerId, refund.externalTransactionId]);
+    expect((await new PendingReferenceWorker(wagers).runOnce()).processed).toBe(1);
+    expect((await rowFor(refund.providerId, refund.externalTransactionId))?.status).toBe(WagerTransactionStatus.Processed);
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('releases a real SQS message after a PostgreSQL serialization failure and processes it after recovery', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = request(wallet.id, playerId, { providerId: `sqs-transient-${playerId}` });
+    const message = envelope(input);
+    await orm.em.getConnection().execute(`create function fail_sqs_consumer_transaction() returns trigger language plpgsql as $$
+      begin
+        if exists(select 1 from wager_transactions where id = new.transaction_id and provider_id = '${input.providerId}') then
+          raise exception 'temporary serialization failure' using errcode = '40001';
+        end if;
+        return new;
+      end; $$`);
+    await orm.em.getConnection().execute(`create trigger fail_sqs_consumer_ledger before insert on wallet_ledger_entries
+      for each row execute function fail_sqs_consumer_transaction()`);
+    try {
+      await send(message, wallet.id);
+      expect(await consumer().runOnce()).toEqual({ received: 1, acknowledged: 0, inboxDuplicates: 0, deferred: 1 });
+      const [rolledBack] = await orm.em.getConnection().execute<Array<{ inbox: string; wagers: string; ledger: string }>>(
+        `select (select count(*) from inbox_messages where consumer_name = ? and message_id = ?)::text as inbox,
+          (select count(*) from wager_transactions where provider_id = ? and external_transaction_id = ?)::text as wagers,
+          (select count(*) from wallet_ledger_entries l join wager_transactions w on w.id = l.transaction_id
+            where l.wallet_id = ? and w.kind <> 'OPENING')::text as ledger`,
+        [consumerName, message.messageId, input.providerId, input.externalTransactionId, wallet.id]);
+      expect(rolledBack).toEqual({ inbox: '0', wagers: '0', ledger: '0' });
+    } finally {
+      await orm.em.getConnection().execute('drop trigger if exists fail_sqs_consumer_ledger on wallet_ledger_entries');
+      await orm.em.getConnection().execute('drop function if exists fail_sqs_consumer_transaction()');
+    }
+    await Bun.sleep(1_100);
+    expect(await consumer().runOnce()).toEqual({ received: 1, acknowledged: 1, inboxDuplicates: 0, deferred: 0 });
+    expect((await rowFor(input.providerId, input.externalTransactionId))?.status).toBe(WagerTransactionStatus.Processed);
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('recovers redelivery when DeleteMessage fails after the database commit', async () => {
+    const playerId = id();
+    const wallet = await wallets.open({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input = request(wallet.id, playerId);
+    const message = envelope(input);
+    await send(message, wallet.id);
+    process.env.WAGER_TEST_ENABLE_FAULTS = 'true';
+    process.env.WAGER_TEST_FAIL_DELETE_ONCE = 'true';
+    try {
+      expect(await consumer().runOnce()).toEqual({ received: 1, acknowledged: 0, inboxDuplicates: 0, deferred: 1 });
+    } finally {
+      delete process.env.WAGER_TEST_FAIL_DELETE_ONCE;
+      delete process.env.WAGER_TEST_ENABLE_FAULTS;
+    }
+    await Bun.sleep(1_100);
+    expect(await consumer().runOnce()).toEqual({ received: 1, acknowledged: 1, inboxDuplicates: 1, deferred: 0 });
+    const [counts] = await orm.em.getConnection().execute<Array<{ inbox: string; wagers: string; ledger: string }>>(
+      `select (select count(*) from inbox_messages where consumer_name = ? and message_id = ?)::text as inbox,
+        (select count(*) from wager_transactions where provider_id = ? and external_transaction_id = ?)::text as wagers,
+        (select count(*) from wallet_ledger_entries l join wager_transactions w on w.id = l.transaction_id
+          where l.wallet_id = ? and w.kind <> 'OPENING')::text as ledger`,
+      [consumerName, message.messageId, input.providerId, input.externalTransactionId, wallet.id]);
+    expect(counts).toEqual({ inbox: '1', wagers: '1', ledger: '1' });
+    expect((await wallets.reconcile(wallet.id))?.consistent).toBe(true);
+  });
+
+  test('routes a permanently malformed FIFO message to its configured DLQ after the receive limit', async () => {
+    await send('{ malformed json', 'poison-message-group');
+    const worker = consumer(1, 1);
+    let deliveries = 0;
+    let deadLetterReceived = false;
+    for (let attempt = 0; attempt < 7 && !deadLetterReceived; attempt += 1) {
+      const stats = await worker.runOnce();
+      if (stats.received) deliveries += 1;
+      const deadLetter = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, MaxNumberOfMessages: 1,
+        WaitTimeSeconds: 1, VisibilityTimeout: 2 }));
+      deadLetterReceived = (deadLetter.Messages?.length ?? 0) > 0;
+      if (!deadLetterReceived) await Bun.sleep(1_100);
+    }
+    expect(deliveries).toBeGreaterThanOrEqual(3);
+    expect(deadLetterReceived).toBe(true);
+  }, 15_000);
 });
